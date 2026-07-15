@@ -4,6 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>HomeHarbor.SystemBuild</AssemblyName>
+    <RootNamespace>HomeHarbor.Tooling</RootNamespace>
     <PackageId>Akaishi.Arch.SystemBuild</PackageId>
     <Description>Manifest-driven Arch Linux system image, kernel, OTA, and installer build engine.</Description>
     <RepositoryUrl>https://github.com/Akaishi-Tech/system-build</RepositoryUrl>

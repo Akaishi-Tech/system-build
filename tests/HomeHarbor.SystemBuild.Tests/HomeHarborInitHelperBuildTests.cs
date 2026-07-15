@@ -1,6 +1,6 @@
 using HomeHarbor.Tooling;
 
-namespace HomeHarbor.Tests;
+namespace HomeHarbor.SystemBuild.Tests;
 
 [TestClass]
 public sealed class HomeHarborInitHelperBuildTests
