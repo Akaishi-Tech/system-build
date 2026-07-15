@@ -466,11 +466,24 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
 
         var stageName = "homeharbor-" + version;
         var stage = Path.Combine(sourceDirectory, stageName);
+        CopyTrackedTree(_root, stage, sourcePaths);
+        await CopyInitializedSubmodulesAsync(stage, cancellationToken);
+        await RunRequiredAsync(
+            "tar",
+            ["-C", sourceDirectory, "-czf", sourceTarball, stageName],
+            cancellationToken);
+    }
+
+    private static void CopyTrackedTree(
+        string sourceRoot,
+        string destinationRoot,
+        IReadOnlyCollection<string> sourcePaths)
+    {
         var included = new HashSet<string>(StringComparer.Ordinal);
         foreach (var sourcePath in sourcePaths)
         {
             var current = sourcePath;
-            while (!string.Equals(current, _root, StringComparison.Ordinal))
+            while (!string.Equals(current, sourceRoot, StringComparison.Ordinal))
             {
                 _ = included.Add(current);
                 current = Path.GetDirectoryName(current)
@@ -479,13 +492,71 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
         }
 
         FileTreeCopier.CopyDirectory(
-            _root,
-            stage,
+            sourceRoot,
+            destinationRoot,
             path => included.Contains(Path.GetFullPath(path)));
-        await RunRequiredAsync(
-            "tar",
-            ["-C", sourceDirectory, "-czf", sourceTarball, stageName],
+    }
+
+    private async Task CopyInitializedSubmodulesAsync(string stage, CancellationToken cancellationToken)
+    {
+        var status = await _runner.RunAsync(
+            "git",
+            ["submodule", "status", "--recursive"],
+            new CommandRunOptions(WorkingDirectory: _root, StreamError: true),
             cancellationToken);
+        _ = status.EnsureSuccess("could not inspect source submodules");
+        var invalidStatus = status.Stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault(line => line.Length == 0 || line[0] != ' ');
+        if (invalidStatus is not null)
+        {
+            throw new InvalidOperationException(
+                "all recursive source submodules must be initialized at their pinned revisions: " +
+                invalidStatus.Trim());
+        }
+
+        var listedSubmodules = await _runner.RunAsync(
+            "git",
+            ["submodule", "foreach", "--recursive", "--quiet", "printf '%s\\0' \"$displaypath\""],
+            new CommandRunOptions(WorkingDirectory: _root, StreamError: true),
+            cancellationToken);
+        _ = listedSubmodules.EnsureSuccess("could not enumerate source submodules");
+        foreach (var relativePath in listedSubmodules.Stdout
+                     .Split('\0', StringSplitOptions.RemoveEmptyEntries)
+                     .Order(StringComparer.Ordinal))
+        {
+            if (Path.IsPathRooted(relativePath) ||
+                relativePath.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries)
+                    .Contains("..", StringComparer.Ordinal))
+            {
+                throw new InvalidOperationException("git returned an unsafe submodule path: " + relativePath);
+            }
+
+            var submoduleRoot = Path.GetFullPath(Path.Combine(_root, relativePath));
+            if (!SecurityGuards.IsInsideDirectory(submoduleRoot, _root) || !Directory.Exists(submoduleRoot))
+            {
+                throw new DirectoryNotFoundException("source submodule is unavailable: " + submoduleRoot);
+            }
+
+            var listed = await _runner.RunAsync(
+                "git",
+                ["ls-files", "--cached", "-z"],
+                new CommandRunOptions(WorkingDirectory: submoduleRoot, StreamError: true),
+                cancellationToken);
+            _ = listed.EnsureSuccess("could not enumerate source submodule " + relativePath);
+            var sourcePaths = SelectCleanSourcePaths(
+                submoduleRoot,
+                listed.Stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries));
+            if (sourcePaths.Count == 0)
+            {
+                throw new InvalidOperationException("source submodule input set is empty: " + relativePath);
+            }
+
+            CopyTrackedTree(
+                submoduleRoot,
+                Path.Combine(stage, relativePath),
+                sourcePaths);
+        }
     }
 
     internal static IReadOnlyList<string> SelectCleanSourcePaths(string root, IEnumerable<string> relativePaths)
