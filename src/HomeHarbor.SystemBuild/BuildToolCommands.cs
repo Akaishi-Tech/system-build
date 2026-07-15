@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace HomeHarbor.Tooling;
@@ -424,41 +425,7 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
         try
         {
             var encodedKey = Path.Combine(work, "homeharbor-avb-public-key.avbpub");
-            var publicKey = ProductBuildEnvironment.Optional(product, "AVB_PUBLIC_KEY");
-            if (!string.IsNullOrWhiteSpace(publicKey))
-            {
-                RequireFile(publicKey, "AVB public key does not point to a readable file");
-                if (IsEncodedAvbPublicKey(publicKey))
-                {
-                    File.Copy(publicKey, encodedKey, overwrite: true);
-                }
-                else
-                {
-                    await RunRequiredAsync("avbtool", ["extract_public_key", "--key", publicKey, "--output", encodedKey], cancellationToken);
-                }
-            }
-            else
-            {
-                var avbPrivateKey = ProductBuildEnvironment.Optional(product, "AVB_PRIVATE_KEY");
-                if (string.IsNullOrWhiteSpace(avbPrivateKey) &&
-                    string.Equals(product.Id, "homeharbor", StringComparison.Ordinal))
-                {
-                    // Schema-one compatibility only. New product profiles must
-                    // use an AVB-specific key and never couple it to Secure Boot.
-                    avbPrivateKey = Env.Optional("HOMEHARBOR_SECURE_BOOT_KEY");
-                }
-                if (!string.IsNullOrWhiteSpace(avbPrivateKey))
-                {
-                    RequireFile(avbPrivateKey, "AVB private key does not point to a readable file");
-                    await RunRequiredAsync("avbtool", ["extract_public_key", "--key", avbPrivateKey, "--output", encodedKey], cancellationToken);
-                }
-                else
-                {
-                    throw new InvalidOperationException(
-                        $"no AVB public key source found; set ARCH_AB_AVB_PUBLIC_KEY, {product.EnvironmentPrefix}_AVB_PUBLIC_KEY, " +
-                        $"ARCH_AB_AVB_PRIVATE_KEY, or {product.EnvironmentPrefix}_AVB_PRIVATE_KEY");
-                }
-            }
+            await WriteEncodedAvbPublicKeyAsync(encodedKey, product, cancellationToken);
 
             _ = Directory.CreateDirectory(Path.GetDirectoryName(fullOutput)!);
             var encoded = await File.ReadAllBytesAsync(encodedKey, cancellationToken);
@@ -469,6 +436,71 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
         {
             DeleteIfExists(work);
         }
+    }
+
+    public async Task GenerateAvbPublicKeyPemAsync(
+        string output,
+        SystemImageProductPlan product,
+        CancellationToken cancellationToken = default)
+    {
+        await RequireToolsAsync(["avbtool", "openssl"], cancellationToken);
+        var fullOutput = Path.GetFullPath(output);
+        var work = Path.Combine(Path.GetTempPath(), "homeharbor-avb-public-key-pem-" + Guid.NewGuid().ToString("N"));
+        _ = Directory.CreateDirectory(work);
+        try
+        {
+            var encodedKey = Path.Combine(work, "homeharbor-avb-public-key.avbpub");
+            await WriteEncodedAvbPublicKeyAsync(encodedKey, product, cancellationToken);
+            var encoded = await File.ReadAllBytesAsync(encodedKey, cancellationToken);
+            var pem = RenderAvbPublicKeyPem(encoded);
+            _ = Directory.CreateDirectory(Path.GetDirectoryName(fullOutput)!);
+            await File.WriteAllTextAsync(fullOutput, pem, Encoding.ASCII, cancellationToken);
+        }
+        finally
+        {
+            DeleteIfExists(work);
+        }
+    }
+
+    private async Task WriteEncodedAvbPublicKeyAsync(
+        string output,
+        SystemImageProductPlan product,
+        CancellationToken cancellationToken)
+    {
+        var publicKey = ProductBuildEnvironment.Optional(product, "AVB_PUBLIC_KEY");
+        if (!string.IsNullOrWhiteSpace(publicKey))
+        {
+            RequireFile(publicKey, "AVB public key does not point to a readable file");
+            if (IsEncodedAvbPublicKey(publicKey))
+            {
+                File.Copy(publicKey, output, overwrite: true);
+            }
+            else
+            {
+                await RunRequiredAsync("avbtool", ["extract_public_key", "--key", publicKey, "--output", output], cancellationToken);
+            }
+
+            return;
+        }
+
+        var avbPrivateKey = ProductBuildEnvironment.Optional(product, "AVB_PRIVATE_KEY");
+        if (string.IsNullOrWhiteSpace(avbPrivateKey) &&
+            string.Equals(product.Id, "homeharbor", StringComparison.Ordinal))
+        {
+            // Schema-one compatibility only. New product profiles must
+            // use an AVB-specific key and never couple it to Secure Boot.
+            avbPrivateKey = Env.Optional("HOMEHARBOR_SECURE_BOOT_KEY");
+        }
+        if (!string.IsNullOrWhiteSpace(avbPrivateKey))
+        {
+            RequireFile(avbPrivateKey, "AVB private key does not point to a readable file");
+            await RunRequiredAsync("avbtool", ["extract_public_key", "--key", avbPrivateKey, "--output", output], cancellationToken);
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"no AVB public key source found; set ARCH_AB_AVB_PUBLIC_KEY, {product.EnvironmentPrefix}_AVB_PUBLIC_KEY, " +
+            $"ARCH_AB_AVB_PRIVATE_KEY, or {product.EnvironmentPrefix}_AVB_PRIVATE_KEY");
     }
 
     private static string RenderAvbPublicKeyHeader(byte[] data)
@@ -492,6 +524,19 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
 
         _ = builder.AppendLine("};");
         return builder.ToString();
+    }
+
+    internal static string RenderAvbPublicKeyPem(byte[] data)
+    {
+        var bits = RequireSelectorSupportedAvbPublicKey(data);
+        var modulusBytes = bits / 8;
+        using var rsa = RSA.Create();
+        rsa.ImportParameters(new RSAParameters
+        {
+            Modulus = data.AsSpan(8, modulusBytes).ToArray(),
+            Exponent = [0x01, 0x00, 0x01]
+        });
+        return rsa.ExportSubjectPublicKeyInfoPem() + "\n";
     }
 
     internal static string RenderProductHeader(

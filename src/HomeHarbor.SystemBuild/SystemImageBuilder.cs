@@ -203,6 +203,7 @@ public sealed class SystemImageBuilder(
             await BuildRecoveryRootfsBaseAsync(recoveryRootfs, packageRepository, cancellationToken);
             InstallProductProfile(rootfs);
             InstallProductProfile(recoveryRootfs);
+            await InstallAvbTrustAnchorsAsync(rootfs, recoveryRootfs, cancellationToken);
             if (plan.Security.Selinux)
             {
                 await SelinuxPolicyValidator.ValidateAsync(rootfs, "system rootfs", _rootless, cancellationToken);
@@ -316,14 +317,14 @@ public sealed class SystemImageBuilder(
         InstallArtifact(modulesImage, plan.Artifacts.Modules);
         InstallArtifact(firmwareImage, plan.Artifacts.Firmware);
 
-        var fullRequiredPaths = RequiredPaths(plan.Rootfs, FullRootfsRequiredPaths);
+        var fullRequiredPaths = RequiredPathsWithAvbTrustAnchor(plan.Rootfs, FullRootfsRequiredPaths);
         ValidateRootfsTree(rootfs, fullRequiredPaths, ForbiddenRootfsPaths, "full rootfs");
         var rootImage = Path.Combine(_work, "root_a.img");
         await erofs.BuildAsync(rootImage, rootfs, rootFileContexts, "/", ["-zlz4hc,12"], cancellationToken);
         await ValidateErofsRootfsAsync(rootImage, fullRequiredPaths, ForbiddenRootfsPaths, "full EROFS rootfs", null, cancellationToken);
         InstallArtifact(rootImage, plan.Artifacts.Rootfs);
 
-        var recoveryRequiredPaths = RequiredPaths(plan.Recovery, RecoveryRootfsRequiredPaths);
+        var recoveryRequiredPaths = RequiredPathsWithAvbTrustAnchor(plan.Recovery, RecoveryRootfsRequiredPaths);
         ValidateRootfsTree(recoveryRootfs, recoveryRequiredPaths, ForbiddenRootfsPaths, "recovery rootfs");
         var recoveryHints = Path.Combine(_work, "recovery-compress-hints");
         await File.WriteAllTextAsync(recoveryHints, "0 boot/recovery_boot[.]efi\n", cancellationToken);
@@ -586,6 +587,41 @@ public sealed class SystemImageBuilder(
         ApplyPlanSubIds(plan.Recovery, recoveryRootfs);
         ApplyPlanLinger(plan.Recovery, recoveryRootfs);
         await EnablePlanUnitsAsync(plan.Recovery, recoveryRootfs, cancellationToken);
+    }
+
+    private async Task InstallAvbTrustAnchorsAsync(
+        string rootfs,
+        string recoveryRootfs,
+        CancellationToken cancellationToken)
+    {
+        if (!plan.Security.Avb)
+        {
+            return;
+        }
+
+        var generated = Path.Combine(_work, "avb-public-key.pem");
+        await new BuildToolCommands(_root, _runner).GenerateAvbPublicKeyPemAsync(
+            generated,
+            plan.Product,
+            cancellationToken);
+        InstallFile(generated, AvbTrustAnchorPath(rootfs, plan.Product), 0644);
+        InstallFile(generated, AvbTrustAnchorPath(recoveryRootfs, plan.Product), 0644);
+    }
+
+    internal static string AvbTrustAnchorPath(string rootfs, SystemImageProductPlan product)
+        => ImagePath(rootfs, AvbTrustAnchorImagePath(product));
+
+    internal static string AvbTrustAnchorImagePath(SystemImageProductPlan product)
+        => $"/usr/share/{product.Id}/system/avb-public-key.pem";
+
+    private IReadOnlyList<string> RequiredPathsWithAvbTrustAnchor(
+        SystemImageRootPlan rootPlan,
+        IReadOnlyList<string> baseline)
+    {
+        var required = RequiredPaths(rootPlan, baseline);
+        return !plan.Security.Avb
+            ? required
+            : required.Append(AvbTrustAnchorImagePath(plan.Product)).Distinct(StringComparer.Ordinal).ToArray();
     }
 
     private async Task<ArchLocalPackageRepository> BuildPackagesAsync(

@@ -345,6 +345,29 @@ public sealed class SystemImageProfileTests
     }
 
     [TestMethod]
+    public void Avb_Trust_Anchor_Uses_Product_Path_And_Exports_Only_Public_Key()
+    {
+        using var rsa = System.Security.Cryptography.RSA.Create(2048);
+        var parameters = rsa.ExportParameters(includePrivateParameters: false);
+        var encoded = new byte[8 + 256 + 256];
+        encoded[2] = 0x08;
+        parameters.Modulus!.CopyTo(encoded, 8);
+
+        var pem = BuildToolCommands.RenderAvbPublicKeyPem(encoded);
+        using var imported = System.Security.Cryptography.RSA.Create();
+        imported.ImportFromPem(pem);
+
+        CollectionAssert.AreEqual(parameters.Modulus, imported.ExportParameters(false).Modulus);
+        Assert.IsFalse(pem.Contains("PRIVATE KEY", StringComparison.Ordinal));
+        Assert.AreEqual(
+            "/usr/share/breakwater/system/avb-public-key.pem",
+            SystemImageBuilder.AvbTrustAnchorImagePath(BreakwaterProduct().ToPlan(2)));
+        Assert.AreEqual(
+            Path.Combine("/image", "usr", "share", "breakwater", "system", "avb-public-key.pem"),
+            SystemImageBuilder.AvbTrustAnchorPath("/image", BreakwaterProduct().ToPlan(2)));
+    }
+
+    [TestMethod]
     public async Task Release_Key_Resolver_Rejects_An_Incomplete_Explicit_Pair()
     {
         var root = Path.Combine(Path.GetTempPath(), "breakwater-incomplete-key-" + Guid.NewGuid().ToString("N"));
