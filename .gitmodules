@@ -1,0 +1,3 @@
+[submodule "external/system-utils"]
+	path = external/system-utils
+	url = https://github.com/Akaishi-Tech/system-utils.git

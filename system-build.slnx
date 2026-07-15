@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/HomeHarbor.SystemBuild/HomeHarbor.SystemBuild.csproj" />
+    <Project Path="src/HomeHarbor.ImageBuilder/HomeHarbor.ImageBuilder.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/HomeHarbor.SystemBuild.Tests/HomeHarbor.SystemBuild.Tests.csproj" />
+  </Folder>
+</Solution>

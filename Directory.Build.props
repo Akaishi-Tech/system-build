@@ -1,0 +1,11 @@
+<Project>
+  <PropertyGroup>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <AnalysisMode>Recommended</AnalysisMode>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
+    <NoWarn>$(NoWarn);CA1416;CA1707;CA1720;CA1859;CA1861</NoWarn>
+  </PropertyGroup>
+</Project>
