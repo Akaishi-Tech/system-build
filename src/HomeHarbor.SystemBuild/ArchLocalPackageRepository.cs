@@ -11,28 +11,42 @@ public static class ArchLocalPackageRepositoryBuilder
         string configDirectory,
         ICommandRunner runner,
         CancellationToken cancellationToken = default)
+        => await CreateAsync(
+            packageDirectory,
+            configDirectory,
+            runner,
+            RepositoryName,
+            cancellationToken);
+
+    public static async Task<ArchLocalPackageRepository> CreateAsync(
+        string packageDirectory,
+        string configDirectory,
+        ICommandRunner runner,
+        string repositoryName,
+        CancellationToken cancellationToken = default)
     {
+        SystemImageBuildDescriptor.ValidateSafePackage(repositoryName, "local repository name");
         var packages = Directory.GetFiles(packageDirectory, "*.pkg.tar.*", SearchOption.TopDirectoryOnly)
             .Where(path => !path.EndsWith(".sig", StringComparison.Ordinal))
             .Order(StringComparer.Ordinal)
             .ToArray();
         if (packages.Length == 0)
         {
-            throw new InvalidOperationException("cannot create an empty HomeHarbor package repository");
+            throw new InvalidOperationException("cannot create an empty local package repository");
         }
 
-        foreach (var existing in Directory.GetFiles(packageDirectory, RepositoryName + ".*").Order(StringComparer.Ordinal))
+        foreach (var existing in Directory.GetFiles(packageDirectory, repositoryName + ".*").Order(StringComparer.Ordinal))
         {
             File.Delete(existing);
         }
 
-        var databasePath = Path.Combine(packageDirectory, RepositoryName + ".db.tar.gz");
+        var databasePath = Path.Combine(packageDirectory, repositoryName + ".db.tar.gz");
         var result = await runner.RunAsync(
             "repo-add",
             [databasePath, .. packages],
             new CommandRunOptions(WorkingDirectory: packageDirectory, StreamOutput: true, StreamError: true),
             cancellationToken);
-        _ = result.EnsureSuccess("could not create the HomeHarbor local package repository");
+        _ = result.EnsureSuccess("could not create the local package repository");
         if (!File.Exists(databasePath))
         {
             throw new InvalidOperationException("repo-add did not create " + databasePath);
@@ -40,7 +54,7 @@ public static class ArchLocalPackageRepositoryBuilder
 
         _ = Directory.CreateDirectory(configDirectory);
         var configPath = Path.Combine(configDirectory, "pacman.conf");
-        await WritePacmanConfigAsync(configPath, packageDirectory, cancellationToken);
+        await WritePacmanConfigAsync(configPath, packageDirectory, repositoryName, cancellationToken);
         return new ArchLocalPackageRepository(packageDirectory, databasePath, configPath);
     }
 
@@ -51,12 +65,20 @@ public static class ArchLocalPackageRepositoryBuilder
         string path,
         string? packageDirectory,
         CancellationToken cancellationToken = default)
+        => await WritePacmanConfigAsync(path, packageDirectory, RepositoryName, cancellationToken);
+
+    internal static async Task WritePacmanConfigAsync(
+        string path,
+        string? packageDirectory,
+        string repositoryName,
+        CancellationToken cancellationToken = default)
     {
+        SystemImageBuildDescriptor.ValidateSafePackage(repositoryName, "local repository name");
         var localRepository = string.IsNullOrWhiteSpace(packageDirectory)
             ? string.Empty
             : $"""
 
-                [{RepositoryName}]
+                [{repositoryName}]
                 SigLevel = Optional TrustAll
                 Server = {new Uri(Path.GetFullPath(packageDirectory) + Path.DirectorySeparatorChar).AbsoluteUri}
                 """;
@@ -81,7 +103,7 @@ public static class ArchLocalPackageRepositoryBuilder
             """;
         if (config.Contains("archlinuxhardened", StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidOperationException("HomeHarbor pacman configuration must not use archlinuxhardened binaries");
+            throw new InvalidOperationException("Arch A/B pacman configuration must not use archlinuxhardened binaries");
         }
 
         await FileWrites.AtomicWriteTextAsync(path, config + "\n", 0644, cancellationToken);

@@ -6,6 +6,8 @@ using System.Text.Json;
 
 namespace HomeHarbor.Tooling;
 
+internal sealed record KernelBootArtifactPaths(string Vmlinuz, string Initramfs);
+
 public sealed class SystemImageBuilder(
     string root,
     string version,
@@ -169,9 +171,12 @@ public sealed class SystemImageBuilder(
 
     public async Task BuildAsync(CancellationToken cancellationToken = default)
     {
-        var channel = ReleaseChannel.Require(Environment.GetEnvironmentVariable("HOMEHARBOR_CHANNEL") ?? "dev", "HOMEHARBOR_CHANNEL");
-        var releaseSequence = ReleaseSequence.RequireEnvironment();
+        var channel = ReleaseChannel.Require(
+            ProductBuildEnvironment.String(plan.Product, "CHANNEL", "dev"),
+            plan.Product.EnvironmentPrefix + "_CHANNEL");
+        var releaseSequence = ReleaseSequence.RequireEnvironment(plan.Product.ToArchAbProfile());
         ValidateVersion();
+        _ = RequireReleasePublicKeyForImage(plan.Product);
         await _rootless.RequireReadyAsync(cancellationToken);
         ValidateReleaseInputs(channel);
         await ValidateSecureBootAsync(cancellationToken);
@@ -196,12 +201,25 @@ public sealed class SystemImageBuilder(
             var packageRepository = await BuildPackagesAsync(channel, packageOutput, cancellationToken);
             await BuildRootfsAsync(rootfs, packageRepository, cancellationToken);
             await BuildRecoveryRootfsBaseAsync(recoveryRootfs, packageRepository, cancellationToken);
-            await SelinuxPolicyValidator.ValidateAsync(rootfs, "system rootfs", _rootless, cancellationToken);
-            await SelinuxPolicyValidator.ValidateAsync(recoveryRootfs, "recovery rootfs", _rootless, cancellationToken);
-            _ = SelinuxPolicyStoreSynchronizer.PrepareImmutableSeed(rootfs);
-            _ = SelinuxPolicyStoreSynchronizer.PrepareImmutableSeed(recoveryRootfs);
-            await ReleaseSequence.StampRootfsOsReleaseAsync(rootfs, releaseSequence, cancellationToken);
-            await ReleaseSequence.StampRootfsOsReleaseAsync(recoveryRootfs, releaseSequence, cancellationToken);
+            InstallProductProfile(rootfs);
+            InstallProductProfile(recoveryRootfs);
+            if (plan.Security.Selinux)
+            {
+                await SelinuxPolicyValidator.ValidateAsync(rootfs, "system rootfs", _rootless, cancellationToken);
+                await SelinuxPolicyValidator.ValidateAsync(recoveryRootfs, "recovery rootfs", _rootless, cancellationToken);
+                _ = SelinuxPolicyStoreSynchronizer.PrepareImmutableSeed(rootfs);
+                _ = SelinuxPolicyStoreSynchronizer.PrepareImmutableSeed(recoveryRootfs);
+            }
+            await ReleaseSequence.StampRootfsOsReleaseAsync(
+                rootfs,
+                releaseSequence,
+                plan.Product.ToArchAbProfile(),
+                cancellationToken);
+            await ReleaseSequence.StampRootfsOsReleaseAsync(
+                recoveryRootfs,
+                releaseSequence,
+                plan.Product.ToArchAbProfile(),
+                cancellationToken);
 
             await BuildImagesAsync(
                 rootfs,
@@ -234,15 +252,17 @@ public sealed class SystemImageBuilder(
 
         await EnsureNoRootfsApiMountsAsync(cancellationToken);
         var kernelRelease = KernelRelease(rootfs);
+        var kernelBootArtifacts = ResolveKernelBootArtifacts(rootfs, kernelRelease);
         var vmlinuz = Path.Combine(_work, "vmlinuz-linux");
         var initramfs = Path.Combine(_work, "initramfs-linux.img");
-        InstallFile(Path.Combine(rootfs, "boot", "vmlinuz-linux"), vmlinuz, 0644);
+        InstallFile(kernelBootArtifacts.Vmlinuz, vmlinuz, 0644);
         await KernelConfigValidator.ValidateAsync(
             vmlinuz,
             Path.Combine(_work, "kernel-config"),
             _runner,
+            plan.Security.Selinux,
             cancellationToken);
-        InstallFile(Path.Combine(rootfs, "boot", "initramfs-linux.img"), initramfs, 0644);
+        InstallFile(kernelBootArtifacts.Initramfs, initramfs, 0644);
         InstallArtifact(vmlinuz, plan.Artifacts.Vmlinuz);
         InstallArtifact(initramfs, plan.Artifacts.Initramfs);
 
@@ -270,17 +290,22 @@ public sealed class SystemImageBuilder(
             initramfs,
             Path.Combine(recoveryRootfs, "etc", "os-release"),
             kernelRelease,
-            SecureBootAssets.RecoveryCmdline(),
+            RecoveryCmdline(),
             cancellationToken);
         InstallFile(recoveryBoot, Path.Combine(recoveryRootfs, "boot", "recovery_boot.efi"), 0644);
 
-        var erofs = await SelinuxErofsTool.CreateAsync(
+        var erofs = await ErofsImageTool.CreateAsync(
+            plan.Security,
             packageRepository.PackageDirectory,
             Path.Combine(_work, "selinux-erofs-tool"),
             _runner,
             cancellationToken);
-        var rootFileContexts = SelinuxErofsTool.RequireFileContexts(rootfs);
-        var recoveryFileContexts = SelinuxErofsTool.RequireFileContexts(recoveryRootfs);
+        var rootFileContexts = plan.Security.Selinux
+            ? SelinuxErofsTool.RequireFileContexts(rootfs)
+            : null;
+        var recoveryFileContexts = plan.Security.Selinux
+            ? SelinuxErofsTool.RequireFileContexts(recoveryRootfs)
+            : null;
 
         var modulesImage = Path.Combine(_work, "modules_a.img");
         var firmwareImage = Path.Combine(_work, "firmware_a.img");
@@ -291,13 +316,15 @@ public sealed class SystemImageBuilder(
         InstallArtifact(modulesImage, plan.Artifacts.Modules);
         InstallArtifact(firmwareImage, plan.Artifacts.Firmware);
 
-        ValidateRootfsTree(rootfs, FullRootfsRequiredPaths, ForbiddenRootfsPaths, "full rootfs");
+        var fullRequiredPaths = RequiredPaths(plan.Rootfs, FullRootfsRequiredPaths);
+        ValidateRootfsTree(rootfs, fullRequiredPaths, ForbiddenRootfsPaths, "full rootfs");
         var rootImage = Path.Combine(_work, "root_a.img");
         await erofs.BuildAsync(rootImage, rootfs, rootFileContexts, "/", ["-zlz4hc,12"], cancellationToken);
-        await ValidateErofsRootfsAsync(rootImage, FullRootfsRequiredPaths, ForbiddenRootfsPaths, "full EROFS rootfs", null, cancellationToken);
+        await ValidateErofsRootfsAsync(rootImage, fullRequiredPaths, ForbiddenRootfsPaths, "full EROFS rootfs", null, cancellationToken);
         InstallArtifact(rootImage, plan.Artifacts.Rootfs);
 
-        ValidateRootfsTree(recoveryRootfs, RecoveryRootfsRequiredPaths, ForbiddenRootfsPaths, "recovery rootfs");
+        var recoveryRequiredPaths = RequiredPaths(plan.Recovery, RecoveryRootfsRequiredPaths);
+        ValidateRootfsTree(recoveryRootfs, recoveryRequiredPaths, ForbiddenRootfsPaths, "recovery rootfs");
         var recoveryHints = Path.Combine(_work, "recovery-compress-hints");
         await File.WriteAllTextAsync(recoveryHints, "0 boot/recovery_boot[.]efi\n", cancellationToken);
         var recoveryImage = Path.Combine(_work, "recovery.img");
@@ -308,7 +335,7 @@ public sealed class SystemImageBuilder(
             "/",
             ["-E^inline_data", "-zlz4hc,12", "--compress-hints=" + recoveryHints],
             cancellationToken);
-        await ValidateErofsRootfsAsync(recoveryImage, RecoveryRootfsRequiredPaths, ForbiddenRootfsPaths, "recovery EROFS rootfs", null, cancellationToken);
+        await ValidateErofsRootfsAsync(recoveryImage, recoveryRequiredPaths, ForbiddenRootfsPaths, "recovery EROFS rootfs", null, cancellationToken);
         await ValidateRecoveryBootErofsAsync(recoveryImage, null, cancellationToken);
         var extractedRecoveryBoot = Path.Combine(_work, "recovery_boot.extracted.efi");
         await RunBinaryStdoutToFileAsync("dump.erofs", ["--cat", "--path", "/boot/recovery_boot.efi", recoveryImage], extractedRecoveryBoot, cancellationToken);
@@ -424,7 +451,7 @@ public sealed class SystemImageBuilder(
             initramfs,
             Path.Combine(rootfs, "etc", "os-release"),
             kernelRelease,
-            SecureBootAssets.GenericBootCmdline(kernelRelease, version, releaseSequence, vbmetaDigestA, vbmetaDigestB, kernelVerityArgs),
+            GenericBootCmdline(kernelRelease, releaseSequence, vbmetaDigestA, vbmetaDigestB, kernelVerityArgs),
             cancellationToken);
         InstallArtifact(boot, plan.Artifacts.Boot);
     }
@@ -472,10 +499,15 @@ public sealed class SystemImageBuilder(
     {
         var mnt = Path.Combine(_work, "mnt");
         _ = Directory.CreateDirectory(mnt);
-        var selector = Path.Combine(_work, "HomeHarborBoot.efi");
-        await new BuildToolCommands(_root, _runner).BuildEfiLoaderAsync(selector, cancellationToken);
+        var selectorName = Path.GetFileName(plan.Artifacts.Bootloader.Path);
+        var selector = Path.Combine(_work, selectorName);
+        await new BuildToolCommands(_root, _runner).BuildEfiLoaderAsync(
+            selector,
+            plan.Product,
+            plan.Security,
+            cancellationToken);
         await InstallBootSelectorAsync(mnt, selector, cancellationToken);
-        if (SecureBootAssets.IsEnabled())
+        if (plan.Security.SecureBoot)
         {
             if (string.IsNullOrWhiteSpace(shimSource) || string.IsNullOrWhiteSpace(mokManagerSource))
             {
@@ -483,11 +515,11 @@ public sealed class SystemImageBuilder(
             }
 
             InstallFile(shimSource, Path.Combine(mnt, "EFI", "BOOT", "BOOTX64.EFI"), 0644);
-            InstallFile(Path.Combine(mnt, "EFI", "HomeHarbor", "HomeHarborBoot.efi"), Path.Combine(mnt, "EFI", "BOOT", "grubx64.efi"), 0644);
+            InstallFile(ProductSelectorPath(mnt), Path.Combine(mnt, "EFI", "BOOT", "grubx64.efi"), 0644);
             InstallFile(mokManagerSource, Path.Combine(mnt, "EFI", "BOOT", "mmx64.efi"), 0644);
         }
 
-        InstallArtifact(Path.Combine(mnt, "EFI", "HomeHarbor", "HomeHarborBoot.efi"), plan.Artifacts.Bootloader);
+        InstallArtifact(ProductSelectorPath(mnt), plan.Artifacts.Bootloader);
         InstallArtifact(Path.Combine(mnt, "EFI", "BOOT", "BOOTX64.EFI"), plan.Artifacts.Bootx64);
     }
 
@@ -499,19 +531,16 @@ public sealed class SystemImageBuilder(
         await RunPacstrapAsync(rootfs, plan.Packages.Rootfs, cancellationToken, pacmanConfig: packageRepository.PacmanConfigPath);
         PrepareWritableRootfs(rootfs);
         InstallPlanDirectories(plan.Rootfs, rootfs);
-        var releasePublicKey = Environment.GetEnvironmentVariable("HOMEHARBOR_RELEASE_PUBLIC_KEY");
-        if (!string.IsNullOrWhiteSpace(releasePublicKey))
-        {
-            InstallFile(releasePublicKey, Path.Combine(rootfs, "etc", "homeharbor", "release.pub.pem"), 0644);
-        }
+        InstallReleaseTrustAnchor(rootfs);
 
         InstallPlanFiles(plan.Rootfs, rootfs);
+        await InstallProductInitramfsAssetsAsync(rootfs, cancellationToken);
         await CreatePlanGroupsAsync(plan.Rootfs, rootfs, cancellationToken);
         await CreatePlanUsersAsync(plan.Rootfs, rootfs, cancellationToken);
         await CreatePlanGeneratedUsersAsync(plan.Rootfs, rootfs, cancellationToken);
         ApplyPlanSubIds(plan.Rootfs, rootfs);
         ApplyPlanLinger(plan.Rootfs, rootfs);
-        var rootPassword = Environment.GetEnvironmentVariable("HOMEHARBOR_DEBUG_ROOT_PASSWORD");
+        var rootPassword = ProductBuildEnvironment.Optional(plan.Product, "DEBUG_ROOT_PASSWORD");
         if (!string.IsNullOrEmpty(rootPassword))
         {
             await RunMappedChrootAsync(rootfs, "chpasswd", [], cancellationToken, standardInput: $"root:{rootPassword}\n");
@@ -541,7 +570,13 @@ public sealed class SystemImageBuilder(
         await RunPacstrapAsync(recoveryRootfs, plan.Packages.Recovery, cancellationToken, pacmanConfig: packageRepository.PacmanConfigPath);
         PrepareWritableRootfs(recoveryRootfs);
         InstallPlanDirectories(plan.Recovery, recoveryRootfs);
-        EnsureDirectory(Path.Combine(recoveryRootfs, "homeharbor-data"), 0750);
+        InstallReleaseTrustAnchor(recoveryRootfs);
+        InstallPlanFiles(plan.Recovery, recoveryRootfs);
+        await InstallProductInitramfsAssetsAsync(recoveryRootfs, cancellationToken);
+        if (string.Equals(plan.Product.Id, "homeharbor", StringComparison.Ordinal))
+        {
+            EnsureDirectory(Path.Combine(recoveryRootfs, "homeharbor-data"), 0750);
+        }
         await WritePlanFstabAsync(plan.Recovery, recoveryRootfs, cancellationToken);
         await File.WriteAllTextAsync(Path.Combine(recoveryRootfs, "etc", "hostname"), plan.Recovery.Hostname + "\n", cancellationToken);
         ApplyPlanShells(plan.Recovery, recoveryRootfs);
@@ -558,11 +593,11 @@ public sealed class SystemImageBuilder(
         string packageOutput,
         CancellationToken cancellationToken)
     {
-        var environment = new Dictionary<string, string>
+        var environment = new Dictionary<string, string?>
         {
-            ["HOMEHARBOR_PACKAGE_OUTPUT"] = packageOutput,
-            ["HOMEHARBOR_PACKAGE_WORK"] = Path.Combine(_work, "arch-package"),
-            ["HOMEHARBOR_CHANNEL"] = channel
+            ["ARCH_AB_PACKAGE_OUTPUT"] = packageOutput,
+            ["ARCH_AB_PACKAGE_WORK"] = Path.Combine(_work, "arch-package"),
+            ["ARCH_AB_CHANNEL"] = channel
         };
         var previousEnvironment = environment.ToDictionary(pair => pair.Key, pair => Environment.GetEnvironmentVariable(pair.Key), StringComparer.Ordinal);
         try
@@ -572,7 +607,7 @@ public sealed class SystemImageBuilder(
                 Environment.SetEnvironmentVariable(key, value);
             }
 
-            return await new BuildToolCommands(_root, _runner).ArchPackageAsync(version, cancellationToken);
+            return await new BuildToolCommands(_root, _runner).ArchPackageAsync(version, plan, cancellationToken);
         }
         finally
         {
@@ -585,18 +620,21 @@ public sealed class SystemImageBuilder(
 
     private void ValidateReleaseInputs(string channel)
     {
-        var releasePublicKey = Environment.GetEnvironmentVariable("HOMEHARBOR_RELEASE_PUBLIC_KEY");
-        var secureBootKey = Environment.GetEnvironmentVariable("HOMEHARBOR_SECURE_BOOT_KEY");
+        var releasePublicKey = ProductBuildEnvironment.Optional(plan.Product, "RELEASE_PUBLIC_KEY");
+        var avbKey = ProductBuildEnvironment.Optional(plan.Product, "AVB_PRIVATE_KEY");
+        if (string.IsNullOrWhiteSpace(avbKey) && string.Equals(plan.Product.Id, "homeharbor", StringComparison.Ordinal))
+        {
+            avbKey = Environment.GetEnvironmentVariable("HOMEHARBOR_SECURE_BOOT_KEY");
+        }
         if (channel != ReleaseChannel.Dev && string.IsNullOrWhiteSpace(releasePublicKey))
         {
             throw new InvalidOperationException(
-                $"Refusing to build {channel} OTA inputs {version} without HOMEHARBOR_RELEASE_PUBLIC_KEY. " +
-                "Set HOMEHARBOR_RELEASE_PUBLIC_KEY to the Ed25519 update-channel public key.");
+                $"Refusing to build {channel} OTA inputs {version} without an explicit product RELEASE_PUBLIC_KEY.");
         }
 
-        if (channel != ReleaseChannel.Dev && string.IsNullOrWhiteSpace(secureBootKey))
+        if (plan.Security.Avb && channel != ReleaseChannel.Dev && string.IsNullOrWhiteSpace(avbKey))
         {
-            throw new InvalidOperationException($"Refusing to build {channel} OTA inputs {version} without HOMEHARBOR_SECURE_BOOT_KEY for AVB signing.");
+            throw new InvalidOperationException($"Refusing to build {channel} OTA inputs {version} without an AVB_PRIVATE_KEY.");
         }
 
         if (channel != ReleaseChannel.Dev && Env.Flag("HOMEHARBOR_ALLOW_UNSIGNED"))
@@ -604,7 +642,7 @@ public sealed class SystemImageBuilder(
             throw new InvalidOperationException($"Refusing to build {channel} OTA inputs with HOMEHARBOR_ALLOW_UNSIGNED=1.");
         }
 
-        if (channel != ReleaseChannel.Dev && Env.Flag("HOMEHARBOR_AVB_ALLOW_UNSIGNED"))
+        if (channel != ReleaseChannel.Dev && ProductBuildEnvironment.Flag(plan.Product, "AVB_ALLOW_UNSIGNED"))
         {
             throw new InvalidOperationException($"Refusing to build {channel} OTA inputs with HOMEHARBOR_AVB_ALLOW_UNSIGNED=1.");
         }
@@ -617,22 +655,22 @@ public sealed class SystemImageBuilder(
             }
         }
 
-        if (!string.IsNullOrWhiteSpace(secureBootKey) && !File.Exists(secureBootKey))
+        if (!string.IsNullOrWhiteSpace(avbKey) && !File.Exists(avbKey))
         {
-            throw new FileNotFoundException("HOMEHARBOR_SECURE_BOOT_KEY does not point to a readable file", secureBootKey);
+            throw new FileNotFoundException("AVB_PRIVATE_KEY does not point to a readable file", avbKey);
         }
-        if (!string.IsNullOrWhiteSpace(secureBootKey))
+        if (!string.IsNullOrWhiteSpace(avbKey))
         {
             _ = BuildKeyDefaults.RequireSupportedAvbSigningAlgorithm(
-                secureBootKey,
-                Environment.GetEnvironmentVariable("HOMEHARBOR_AVB_ALGORITHM"));
+                avbKey,
+                ProductBuildEnvironment.Optional(plan.Product, "AVB_ALGORITHM"));
         }
     }
 
     private async Task ValidateSecureBootAsync(CancellationToken cancellationToken)
     {
         _ = await FindUkifyAsync(cancellationToken);
-        if (!SecureBootAssets.IsEnabled())
+        if (!plan.Security.SecureBoot)
         {
             return;
         }
@@ -671,7 +709,7 @@ public sealed class SystemImageBuilder(
 
     private async Task<(string? ShimSource, string? MokManagerSource)> PrepareShimSourcesAsync(CancellationToken cancellationToken)
     {
-        if (!SecureBootAssets.IsEnabled())
+        if (!plan.Security.SecureBoot)
         {
             return (null, null);
         }
@@ -908,7 +946,7 @@ public sealed class SystemImageBuilder(
             "--cmdline=@" + cmdlineFile,
             "--output=" + output
         };
-        if (SecureBootAssets.IsEnabled())
+        if (plan.Security.SecureBoot)
         {
             var (Key, Certificate) = SecureBootAssets.RequireSigningAssets();
             args.Insert(args.Count - 1, "--secureboot-private-key=" + Key);
@@ -960,8 +998,8 @@ public sealed class SystemImageBuilder(
             cancellationToken);
     }
 
-    private static string AvbSalt(string partitionName)
-        => Convert.ToHexString(SHA256.HashData(Encoding.ASCII.GetBytes("homeharbor-avb:" + partitionName))).ToLowerInvariant();
+    private string AvbSalt(string partitionName)
+        => Convert.ToHexString(SHA256.HashData(Encoding.ASCII.GetBytes(plan.Product.Id + "-avb:" + partitionName))).ToLowerInvariant();
 
     private static void EnsureSameBytes(string left, string right, string label)
     {
@@ -1011,14 +1049,18 @@ public sealed class SystemImageBuilder(
         await RunAsync("avbtool", args, cancellationToken);
     }
 
-    private static IReadOnlyList<string> AvbSigningArgs()
+    private IReadOnlyList<string> AvbSigningArgs()
     {
-        var key = Environment.GetEnvironmentVariable("HOMEHARBOR_SECURE_BOOT_KEY");
+        var key = ProductBuildEnvironment.Optional(plan.Product, "AVB_PRIVATE_KEY");
+        if (string.IsNullOrWhiteSpace(key) && string.Equals(plan.Product.Id, "homeharbor", StringComparison.Ordinal))
+        {
+            key = Environment.GetEnvironmentVariable("HOMEHARBOR_SECURE_BOOT_KEY");
+        }
         return !string.IsNullOrWhiteSpace(key)
-            ? ["--algorithm", Env.String("HOMEHARBOR_AVB_ALGORITHM", "SHA256_RSA2048"), "--key", key]
-            : Env.Flag("HOMEHARBOR_AVB_ALLOW_UNSIGNED") || Env.Flag("HOMEHARBOR_ALLOW_UNSIGNED")
+            ? ["--algorithm", ProductBuildEnvironment.String(plan.Product, "AVB_ALGORITHM", "SHA256_RSA2048"), "--key", key]
+            : ProductBuildEnvironment.Flag(plan.Product, "AVB_ALLOW_UNSIGNED") || Env.Flag("HOMEHARBOR_ALLOW_UNSIGNED")
             ? ["--algorithm", "NONE"]
-            : throw new InvalidOperationException("HOMEHARBOR_SECURE_BOOT_KEY is required for signed vbmeta; set HOMEHARBOR_AVB_ALLOW_UNSIGNED=1 only for explicit unsigned development builds");
+            : throw new InvalidOperationException("an AVB_PRIVATE_KEY is required for signed vbmeta; set ARCH_AB_AVB_ALLOW_UNSIGNED=1 only for explicit development builds");
     }
 
     private async Task<string> AvbVbmetaDigestAsync(string image, CancellationToken cancellationToken)
@@ -1056,13 +1098,13 @@ public sealed class SystemImageBuilder(
 
     private async Task<string> AvbHelperPathAsync(CancellationToken cancellationToken)
     {
-        var helper = Environment.GetEnvironmentVariable("HOMEHARBOR_AVB_HELPER");
+        var helper = ProductBuildEnvironment.Optional(plan.Product, "AVB_HELPER");
         if (!string.IsNullOrWhiteSpace(helper))
         {
-            return !File.Exists(helper) ? throw new FileNotFoundException("HOMEHARBOR_AVB_HELPER is not executable", helper) : helper;
+            return !File.Exists(helper) ? throw new FileNotFoundException("AVB_HELPER is not executable", helper) : helper;
         }
 
-        helper = Path.Combine(_work, "homeharbor-avb");
+        helper = Path.Combine(_work, "arch-ab-avb");
         if (!File.Exists(helper))
         {
             await BuildAvbHelperAsync(helper, cancellationToken);
@@ -1083,7 +1125,7 @@ public sealed class SystemImageBuilder(
             ? value
             : throw new InvalidOperationException("AVB descriptor output is missing " + name);
 
-    private static string KernelVerityCmdlineArgs(params string?[] values)
+    private string KernelVerityCmdlineArgs(params string?[] values)
     {
         var names = new[] { "modules_a", "modules_b", "firmware_a", "firmware_b", "recovery_a", "recovery_b" };
         var args = new List<string>();
@@ -1091,7 +1133,7 @@ public sealed class SystemImageBuilder(
         {
             if (!string.IsNullOrWhiteSpace(values[i]))
             {
-                args.Add($"homeharbor.{names[i]}_verity={values[i]}");
+                args.Add($"{plan.Product.KernelParameterPrefix}.{names[i]}_verity={values[i]}");
             }
         }
 
@@ -1132,7 +1174,7 @@ public sealed class SystemImageBuilder(
 
     private async Task InstallBootSelectorAsync(string esp, string selector, CancellationToken cancellationToken)
     {
-        var homeHarborBoot = Path.Combine(esp, "EFI", "HomeHarbor", "HomeHarborBoot.efi");
+        var homeHarborBoot = ProductSelectorPath(esp);
         var bootx64 = Path.Combine(esp, "EFI", "BOOT", "BOOTX64.EFI");
         InstallFile(selector, homeHarborBoot, 0644);
         InstallFile(selector, bootx64, 0644);
@@ -1142,7 +1184,7 @@ public sealed class SystemImageBuilder(
 
     private async Task SignEfiFileAsync(string path, CancellationToken cancellationToken)
     {
-        if (!SecureBootAssets.IsEnabled() || !File.Exists(path))
+        if (!plan.Security.SecureBoot || !File.Exists(path))
         {
             return;
         }
@@ -1227,6 +1269,182 @@ public sealed class SystemImageBuilder(
         return args;
     }
 
+    private IReadOnlyList<string> RequiredPaths(
+        SystemImageRootPlan rootPlan,
+        IReadOnlyList<string> homeHarborPaths)
+    {
+        if (string.Equals(plan.Product.Id, "homeharbor", StringComparison.Ordinal))
+        {
+            return homeHarborPaths;
+        }
+
+        return new[]
+            {
+                "/",
+                "/bin",
+                "/boot",
+                "/dev",
+                "/etc",
+                "/etc/hostname",
+                "/etc/fstab",
+                "/etc/resolv.conf",
+                "/proc",
+                "/run",
+                "/sys",
+                "/tmp",
+                "/usr",
+                "/usr/bin/dotnet",
+                "/usr/bin/dmsetup",
+                "/usr/bin/lpdump",
+                "/usr/lib/modules",
+                "/usr/lib/firmware",
+                "/usr/lib/systemd/systemd",
+                "/var"
+            }
+            .Concat(rootPlan.Directories)
+            .Concat(rootPlan.Files.Select(file => file.Destination))
+            .Concat(rootPlan.Fstab.Select(entry => entry.MountPoint))
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private void InstallProductProfile(string rootfs)
+    {
+        var destination = Path.Combine(
+            rootfs,
+            "usr",
+            "share",
+            plan.Product.PackagePrefix,
+            "system");
+        _ = Directory.CreateDirectory(destination);
+        plan.Product.ToArchAbProfile().Write(Path.Combine(destination, "arch-ab-product.json"));
+
+        var manifest = SystemImageBuildDescriptor.DefaultManifestPath(_root);
+        if (File.Exists(manifest))
+        {
+            InstallFile(manifest, Path.Combine(destination, "manifest.yml"), 0644);
+        }
+    }
+
+    private async Task InstallProductInitramfsAssetsAsync(
+        string rootfs,
+        CancellationToken cancellationToken)
+    {
+        var productWork = Path.Combine(_work, "product-boot-tools");
+        _ = Directory.CreateDirectory(productWork);
+        var avb = Path.Combine(productWork, plan.Product.PackagePrefix + "-avb");
+        var init = Path.Combine(productWork, plan.Product.PackagePrefix + "-verity");
+        var commands = new BuildToolCommands(_root, _runner);
+        if (!File.Exists(avb))
+        {
+            await commands.BuildProductAvbAsync(avb, plan.Product, cancellationToken);
+        }
+        if (!File.Exists(init))
+        {
+            await commands.BuildProductInitAsync(init, plan.Product, cancellationToken);
+        }
+
+        InstallFile(
+            avb,
+            Path.Combine(rootfs, "usr", "lib", plan.Product.PackagePrefix, plan.Product.PackagePrefix + "-avb"),
+            0755);
+        InstallFile(
+            init,
+            Path.Combine(rootfs, "boot", "init", plan.Product.PackagePrefix + "-verity"),
+            0755);
+
+        var installScript = BuildToolCommands.ProductizeText(
+            File.ReadAllText(SystemUtilityAssets.RequireAsset(_root, "os", "mkinitcpio", "install", "homeharbor-verity")),
+            plan.Product);
+        var hookScript = BuildToolCommands.ProductizeText(
+            File.ReadAllText(SystemUtilityAssets.RequireAsset(_root, "os", "mkinitcpio", "hooks", "homeharbor-verity")),
+            plan.Product);
+        FileWrites.AtomicWriteText(
+            Path.Combine(rootfs, "etc", "initcpio", "install", "arch-ab-verity"),
+            installScript,
+            0755);
+        FileWrites.AtomicWriteText(
+            Path.Combine(rootfs, "etc", "initcpio", "hooks", "arch-ab-verity"),
+            hookScript,
+            0755);
+    }
+
+    private string ProductSelectorPath(string esp)
+        => ProductSelectorPathFor(plan.Product, esp);
+
+    internal static string ProductSelectorPathFor(SystemImageProductPlan product, string esp)
+        => product.ToArchAbProfile().CanonicalSelectorPathForEsp(esp);
+
+    internal static string RequireReleasePublicKeyForImage(SystemImageProductPlan product)
+    {
+        var path = ProductBuildEnvironment.Optional(product, "RELEASE_PUBLIC_KEY")
+            ?? throw new InvalidOperationException(
+                $"Refusing to build {product.DisplayName} image without a RELEASE_PUBLIC_KEY trust anchor.");
+        var info = new FileInfo(path);
+        if (!info.Exists || info.Length == 0 || info.LinkTarget is not null ||
+            (info.Attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+        {
+            throw new InvalidOperationException(
+                "RELEASE_PUBLIC_KEY is missing, empty, or not a regular non-link file: " + path);
+        }
+
+        return Path.GetFullPath(path);
+    }
+
+    internal static string ReleaseTrustAnchorPath(string rootfs, SystemImageProductPlan product)
+        => Path.Combine(rootfs, "etc", product.PackagePrefix, "release.pub.pem");
+
+    private void InstallReleaseTrustAnchor(string rootfs)
+        => InstallFile(
+            RequireReleasePublicKeyForImage(plan.Product),
+            ReleaseTrustAnchorPath(rootfs, plan.Product),
+            0644);
+
+    private string GenericBootCmdline(
+        string kernelRelease,
+        long releaseSequence,
+        string vbmetaADigest,
+        string vbmetaBDigest,
+        string kernelVerityArgs)
+    {
+        _ = ReleaseSequence.RequirePositive(releaseSequence, "release sequence");
+        var prefix = plan.Product.KernelParameterPrefix;
+        var arguments = new List<string>(plan.KernelArgs)
+        {
+            "ro",
+            $"rd.{prefix}.verity=1",
+            $"root=/dev/mapper/{prefix}-root",
+            "rootfstype=erofs",
+            $"{prefix}.boot_generic=1",
+            $"{prefix}.super=/dev/disk/by-partlabel/{plan.Super.Name}",
+            $"{prefix}.kernel_release={kernelRelease}",
+            $"{prefix}.vbmeta_a_digest={vbmetaADigest}",
+            $"{prefix}.vbmeta_b_digest={vbmetaBDigest}",
+            $"{prefix}.release_sequence={releaseSequence}",
+            $"{prefix}.version={version}"
+        };
+        if (!string.IsNullOrWhiteSpace(kernelVerityArgs))
+        {
+            arguments.Add(kernelVerityArgs);
+        }
+
+        return string.Join(' ', arguments.Distinct(StringComparer.Ordinal));
+    }
+
+    private string RecoveryCmdline()
+    {
+        var prefix = plan.Product.KernelParameterPrefix;
+        return string.Join(' ', new List<string>(plan.KernelArgs)
+        {
+            "ro",
+            $"rd.{prefix}.verity=1",
+            $"{prefix}.recovery=1",
+            $"root=/dev/mapper/{prefix}-recovery-root",
+            "rootfstype=erofs"
+        }.Distinct(StringComparer.Ordinal));
+    }
+
     private static void ValidateRootfsTree(
         string root,
         IReadOnlyList<string> requiredPaths,
@@ -1288,10 +1506,16 @@ public sealed class SystemImageBuilder(
         }
     }
 
-    private static async Task WritePlanFstabAsync(SystemImageRootPlan rootPlan, string rootfs, CancellationToken cancellationToken)
+    internal static async Task WritePlanFstabAsync(SystemImageRootPlan rootPlan, string rootfs, CancellationToken cancellationToken)
+        => await File.WriteAllTextAsync(
+            Path.Combine(rootfs, "etc", "fstab"),
+            RenderPlanFstab(rootPlan.Fstab),
+            cancellationToken);
+
+    internal static string RenderPlanFstab(IReadOnlyList<SystemImageFstabEntryPlan> entries)
     {
         var builder = new StringBuilder();
-        foreach (var entry in rootPlan.Fstab)
+        foreach (var entry in entries)
         {
             _ = builder.Append(entry.Spec)
                 .Append(' ')
@@ -1307,7 +1531,21 @@ public sealed class SystemImageBuilder(
                 .Append('\n');
         }
 
-        await File.WriteAllTextAsync(Path.Combine(rootfs, "etc", "fstab"), builder.ToString(), cancellationToken);
+        return builder.ToString();
+    }
+
+    internal static IReadOnlyList<SystemImageFstabEntryPlan> MergeRecoveryFstab(
+        IReadOnlyList<SystemImageFstabEntryPlan> rootfsEntries,
+        IReadOnlyList<SystemImageFstabEntryPlan> recoveryEntries)
+    {
+        var recoveryMounts = recoveryEntries
+            .Select(entry => entry.MountPoint)
+            .ToHashSet(StringComparer.Ordinal);
+        return
+        [
+            .. rootfsEntries.Where(entry => !recoveryMounts.Contains(entry.MountPoint)),
+            .. recoveryEntries
+        ];
     }
 
     private static void ApplyPlanShells(SystemImageRootPlan rootPlan, string rootfs)
@@ -1572,6 +1810,33 @@ public sealed class SystemImageBuilder(
         return releases.Length != 1
             ? throw new InvalidOperationException($"expected exactly one kernel modules directory, found {releases.Length}: {(releases.Length == 0 ? "none" : string.Join(' ', releases))}")
             : releases[0]!;
+    }
+
+    internal static KernelBootArtifactPaths ResolveKernelBootArtifacts(string rootfs, string kernelRelease)
+    {
+        var modulesDirectory = Path.Combine(rootfs, "usr", "lib", "modules", kernelRelease);
+        var pkgbasePath = Path.Combine(modulesDirectory, "pkgbase");
+        if (!File.Exists(pkgbasePath))
+        {
+            throw new InvalidOperationException(
+                $"kernel modules directory {modulesDirectory} has no pkgbase metadata");
+        }
+
+        var pkgbase = File.ReadAllText(pkgbasePath).Trim();
+        SystemImageBuildDescriptor.ValidateSafePackage(pkgbase, "installed kernel pkgbase");
+        var vmlinuz = Path.Combine(rootfs, "boot", "vmlinuz-" + pkgbase);
+        var initramfs = Path.Combine(rootfs, "boot", "initramfs-" + pkgbase + ".img");
+        RequireNonemptyKernelBootArtifact(vmlinuz, $"kernel {pkgbase} image");
+        RequireNonemptyKernelBootArtifact(initramfs, $"kernel {pkgbase} initramfs");
+        return new KernelBootArtifactPaths(vmlinuz, initramfs);
+    }
+
+    private static void RequireNonemptyKernelBootArtifact(string path, string label)
+    {
+        if (!File.Exists(path) || new FileInfo(path).Length == 0)
+        {
+            throw new InvalidOperationException($"missing nonempty {label}: {path}");
+        }
     }
 
     private static void AppendLineIfMissingPrefix(string path, string prefix, string line)

@@ -17,6 +17,27 @@ internal static class ArchPackageArchiveValidator
         ICommandRunner runner,
         CancellationToken cancellationToken)
     {
+        await ValidatePackagesAsync(
+            packageDirectory,
+            version,
+            RequiredHomeHarborPackages,
+            runner,
+            cancellationToken);
+    }
+
+    internal static async Task ValidatePackagesAsync(
+        string packageDirectory,
+        string version,
+        IReadOnlyCollection<string> requiredPackages,
+        ICommandRunner runner,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(requiredPackages);
+        if (requiredPackages.Count == 0 || requiredPackages.Any(string.IsNullOrWhiteSpace))
+        {
+            throw new InvalidOperationException("required local package names must not be empty");
+        }
+
         var metadata = new List<ArchPackageMetadata>();
         foreach (var archive in Directory.GetFiles(packageDirectory, "*.pkg.tar.*", SearchOption.TopDirectoryOnly)
                      .Where(path => !path.EndsWith(".sig", StringComparison.Ordinal))
@@ -30,7 +51,7 @@ internal static class ArchPackageArchiveValidator
             metadata.Add(ParsePackageInfo(result.Stdout, archive));
         }
 
-        ValidateHomeHarborMetadata(metadata, version);
+        ValidateMetadata(metadata, version, requiredPackages);
     }
 
     internal static ArchPackageMetadata ParsePackageInfo(string packageInfo, string label)
@@ -52,13 +73,19 @@ internal static class ArchPackageArchiveValidator
     internal static void ValidateHomeHarborMetadata(
         IEnumerable<ArchPackageMetadata> metadata,
         string version)
+        => ValidateMetadata(metadata, version, RequiredHomeHarborPackages);
+
+    internal static void ValidateMetadata(
+        IEnumerable<ArchPackageMetadata> metadata,
+        string version,
+        IReadOnlyCollection<string> requiredPackages)
     {
         var expectedVersion = version.Replace('-', '_') + "-1";
         var packages = metadata
-            .Where(package => RequiredHomeHarborPackages.Contains(package.Name, StringComparer.Ordinal))
+            .Where(package => requiredPackages.Contains(package.Name, StringComparer.Ordinal))
             .GroupBy(package => package.Name, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.Ordinal);
-        foreach (var required in RequiredHomeHarborPackages)
+        foreach (var required in requiredPackages)
         {
             if (!packages.TryGetValue(required, out var matches) || matches.Length != 1)
             {

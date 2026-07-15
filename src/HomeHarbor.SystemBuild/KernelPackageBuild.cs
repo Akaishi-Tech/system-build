@@ -12,7 +12,9 @@ public sealed record KernelPackageBuildChannelPlan(
     KernelPackageInputPlan? Module,
     IReadOnlyList<KernelPackageFilePlan> RequiredFiles,
     IReadOnlyList<KernelPackageBuildCommandPlan> ArtifactBuilds,
-    IReadOnlyList<KernelPackageAddonPlan> Addons);
+    IReadOnlyList<KernelPackageAddonPlan> Addons,
+    IReadOnlyList<string> ConfigFragments,
+    IReadOnlyList<string> RequiredConfig);
 
 public sealed record KernelPackageInputPlan(
     string Package,
@@ -59,7 +61,7 @@ public sealed partial class KernelPackageBuildDescriptor
     private static partial Regex ForbiddenEnvKeyPattern();
 
     private static readonly HashSet<string> ValidOrigins = ["upstream-arch-binary", "source-build", "local-artifact"];
-    private static readonly HashSet<string> ValidBuildTypes = ["zfs-lts-artifacts", "zfs-utils-addon"];
+    private static readonly HashSet<string> ValidBuildTypes = ["zfs-lts-artifacts", "zfs-utils-addon", "arch-pkgbuild"];
     private static readonly string[] RequiredChannels = ["generic", "zfs"];
 
     public int SchemaVersion { get; set; }
@@ -71,6 +73,10 @@ public sealed partial class KernelPackageBuildDescriptor
     public KernelPackageInputDescriptor? Module { get; set; }
 
     public KernelPackageArtifactsDescriptor Artifacts { get; set; } = new();
+
+    public List<string> ConfigFragments { get; set; } = [];
+
+    public List<string> RequiredConfig { get; set; } = [];
 
     public List<KernelPackageBuildDescriptorItem> ArtifactBuilds { get; set; } = [];
 
@@ -95,16 +101,19 @@ public sealed partial class KernelPackageBuildDescriptor
             throw new InvalidOperationException("kernel package descriptor root must contain system/x86_64/kernel/{name}/manifest.yml files");
         }
 
-        var channels = manifestPaths
+        var descriptors = manifestPaths
             .Select(path =>
             {
-                var plan = Load(path).ToPlan(Path.GetFullPath(root), version);
+                var descriptor = Load(path);
+                var plan = descriptor.ToPlan(Path.GetFullPath(root), version);
                 var directoryName = Path.GetFileName(Path.GetDirectoryName(path));
-                return !string.Equals(plan.Name, directoryName, StringComparison.Ordinal)
+                var validated = !string.Equals(plan.Name, directoryName, StringComparison.Ordinal)
                     ? throw new InvalidOperationException($"kernel package manifest name must match its directory: {path}")
                     : plan;
+                return (descriptor.SchemaVersion, Plan: validated);
             })
             .ToList();
+        var channels = descriptors.Select(item => item.Plan).ToList();
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var channel in channels)
@@ -115,7 +124,7 @@ public sealed partial class KernelPackageBuildDescriptor
             }
         }
 
-        foreach (var required in RequiredChannels)
+        foreach (var required in descriptors.Any(item => item.SchemaVersion == 1) ? RequiredChannels : [])
         {
             if (!seen.Contains(required))
             {
@@ -144,20 +153,24 @@ public sealed partial class KernelPackageBuildDescriptor
 
     public KernelPackageBuildChannelPlan ToPlan(string root, string version)
     {
-        if (SchemaVersion != 1)
+        if (SchemaVersion is not (1 or 2))
         {
-            throw new InvalidOperationException("kernel package manifest requires schemaVersion=1");
+            throw new InvalidOperationException("kernel package manifest requires schemaVersion=1 or schemaVersion=2");
         }
 
         var name = KernelChannel.Require(Name, "kernel package manifest name");
         var requiredFiles = Artifacts.ToFilePlans(root, version);
+        var configFragments = Kernel.ConfigFragments.Count > 0 ? Kernel.ConfigFragments : ConfigFragments;
+        var requiredConfig = Kernel.RequiredConfig.Count > 0 ? Kernel.RequiredConfig : RequiredConfig;
         return new KernelPackageBuildChannelPlan(
             name,
             ToInputPlan(Kernel, $"{name} kernel", root, version),
             Module is null ? null : ToInputPlan(Module, $"{name} module", root, version),
             requiredFiles,
             ArtifactBuilds.Select(build => build.ToPlan(root, version, "")).ToList(),
-            Addons.Select(addon => addon.ToPlan(root, version)).ToList());
+            Addons.Select(addon => addon.ToPlan(root, version)).ToList(),
+            configFragments.Select((path, index) => ResolvePath(root, version, path, $"{name} config fragment {index}")).ToList(),
+            NormalizeRequiredConfig(requiredConfig, $"{name} requiredConfig"));
     }
 
     internal static KernelPackageInputPlan ToInputPlan(KernelPackageInputDescriptor input, string name, string root, string version)
@@ -190,7 +203,7 @@ public sealed partial class KernelPackageBuildDescriptor
     internal static string RequireBuildType(string? value, string name)
     {
         return string.IsNullOrWhiteSpace(value) || !ValidBuildTypes.Contains(value.Trim())
-            ? throw new InvalidOperationException($"{name} must be zfs-lts-artifacts or zfs-utils-addon")
+            ? throw new InvalidOperationException($"{name} must be zfs-lts-artifacts, zfs-utils-addon, or arch-pkgbuild")
             : value.Trim();
     }
 
@@ -268,6 +281,30 @@ public sealed partial class KernelPackageBuildDescriptor
 
         return keys.Distinct(StringComparer.Ordinal).ToList();
     }
+
+    private static IReadOnlyList<string> NormalizeRequiredConfig(IEnumerable<string>? values, string name)
+    {
+        if (values is null)
+        {
+            return [];
+        }
+
+        var result = new List<string>();
+        foreach (var value in values)
+        {
+            var trimmed = value?.Trim();
+            if (string.IsNullOrWhiteSpace(trimmed) ||
+                !trimmed.StartsWith("CONFIG_", StringComparison.Ordinal) ||
+                !trimmed.Contains('=') ||
+                trimmed.Any(char.IsWhiteSpace))
+            {
+                throw new InvalidOperationException(name + " entries must use CONFIG_NAME=value syntax");
+            }
+            result.Add(trimmed);
+        }
+
+        return result.Distinct(StringComparer.Ordinal).ToList();
+    }
 }
 
 public sealed class KernelPackageInputDescriptor
@@ -277,6 +314,10 @@ public sealed class KernelPackageInputDescriptor
     public string? Origin { get; set; }
 
     public KernelPackageSourceDescriptor? Source { get; set; }
+
+    public List<string> ConfigFragments { get; set; } = [];
+
+    public List<string> RequiredConfig { get; set; } = [];
 }
 
 public sealed class KernelPackageSourceDescriptor

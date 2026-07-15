@@ -11,12 +11,38 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
 
     public async Task BuildEfiLoaderAsync(string output, CancellationToken cancellationToken = default)
     {
+        var plan = SystemImageBuildDescriptor.LoadDefaultPlan(_root, "0.0.0");
+        await BuildEfiLoaderAsync(output, plan.Product, plan.Security, cancellationToken);
+    }
+
+    public async Task BuildEfiLoaderAsync(
+        string output,
+        SystemImageProductPlan product,
+        CancellationToken cancellationToken = default)
+        => await BuildEfiLoaderAsync(
+            output,
+            product,
+            new SystemImageSecurityPlan(true, SecureBootAssets.IsEnabled(), true, false),
+            cancellationToken);
+
+    public async Task BuildEfiLoaderAsync(
+        string output,
+        SystemImageProductPlan product,
+        SystemImageSecurityPlan security,
+        CancellationToken cancellationToken = default)
+    {
         var fullOutput = Path.GetFullPath(output);
         await RequireToolsAsync(["avbtool", "clang", "lld-link", "make", "openssl"], cancellationToken);
         _ = Directory.CreateDirectory(Path.GetDirectoryName(fullOutput)!);
         var buildDirectory = Path.Combine(_root, ".work", "efi-loader");
         var publicKeyHeader = Path.Combine(buildDirectory, "homeharbor-avb-public-key.h");
-        await GenerateEfiAvbPublicKeyHeaderAsync(publicKeyHeader, cancellationToken);
+        var productHeader = Path.Combine(buildDirectory, "arch-ab-product.h");
+        await GenerateEfiAvbPublicKeyHeaderAsync(publicKeyHeader, product, cancellationToken);
+        await File.WriteAllTextAsync(
+            productHeader,
+            RenderProductHeader(product, security),
+            Encoding.ASCII,
+            cancellationToken);
         var makefile = SystemUtilityAssets.RequireAsset(_root, "boot", "bootloader", "Makefile");
         await RunRequiredAsync(
             "make",
@@ -26,6 +52,11 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
                 "OUTPUT=" + fullOutput,
                 "BUILD_DIR=" + buildDirectory,
                 "AVB_PUBLIC_KEY_HEADER=" + publicKeyHeader,
+                "PRODUCT_HEADER=" + productHeader,
+                "PRODUCT_DISPLAY_NAME=" + product.DisplayName,
+                "EFI_DIRECTORY=" + product.EfiDirectory,
+                "BOOT_STATE_PATH=" + product.BootStatePath,
+                "EFI_VARIABLE_PREFIX=" + product.EfiVariablePrefix,
                 "all"
             ],
             cancellationToken);
@@ -63,6 +94,71 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
                 SystemUtilityAssets.RequireAsset(_root, "boot", "init", "homeharbor-verity.c")),
             cancellationToken);
         Console.WriteLine("Built " + fullOutput);
+    }
+
+    public async Task BuildProductAvbAsync(
+        string output,
+        SystemImageProductPlan product,
+        CancellationToken cancellationToken = default)
+    {
+        var fullOutput = Path.GetFullPath(output);
+        await RequireToolsAsync(["cc"], cancellationToken);
+        var source = await WriteProductizedSourceAsync(
+            SystemUtilityAssets.RequireAsset(_root, "boot", "avb", "homeharbor-avb.c"),
+            product,
+            "arch-ab-avb.c",
+            cancellationToken);
+        _ = Directory.CreateDirectory(Path.GetDirectoryName(fullOutput)!);
+        await RunRequiredAsync(
+            "cc",
+            ["-O2", "-Wall", "-Wextra", "-o", fullOutput, source, "-lcrypto"],
+            cancellationToken);
+        Console.WriteLine("Built " + fullOutput);
+    }
+
+    public async Task BuildProductInitAsync(
+        string output,
+        SystemImageProductPlan product,
+        CancellationToken cancellationToken = default)
+    {
+        var fullOutput = Path.GetFullPath(output);
+        await RequireToolsAsync(["cc"], cancellationToken);
+        var source = await WriteProductizedSourceAsync(
+            SystemUtilityAssets.RequireAsset(_root, "boot", "init", "homeharbor-verity.c"),
+            product,
+            "arch-ab-verity.c",
+            cancellationToken);
+        _ = Directory.CreateDirectory(Path.GetDirectoryName(fullOutput)!);
+        await RunRequiredAsync(
+            "cc",
+            HomeHarborInitHelperBuild.CompileArguments(fullOutput, source),
+            cancellationToken);
+        Console.WriteLine("Built " + fullOutput);
+    }
+
+    internal static string ProductizeText(string input, SystemImageProductPlan product)
+        => input
+            .Replace(EfiBootVariables.VendorGuid, product.EfiVendorGuid, StringComparison.OrdinalIgnoreCase)
+            .Replace("HOMEHARBOR", product.EnvironmentPrefix, StringComparison.Ordinal)
+            .Replace("HomeHarbor", product.EfiVariablePrefix, StringComparison.Ordinal)
+            .Replace("rd.homeharbor.", "rd." + product.KernelParameterPrefix + ".", StringComparison.Ordinal)
+            .Replace("homeharbor.", product.KernelParameterPrefix + ".", StringComparison.Ordinal)
+            .Replace("homeharbor", product.PackagePrefix, StringComparison.Ordinal);
+
+    private async Task<string> WriteProductizedSourceAsync(
+        string source,
+        SystemImageProductPlan product,
+        string fileName,
+        CancellationToken cancellationToken)
+    {
+        var outputDirectory = Path.Combine(_root, ".work", "product-sources", product.Id);
+        _ = Directory.CreateDirectory(outputDirectory);
+        var output = Path.Combine(outputDirectory, fileName);
+        await File.WriteAllTextAsync(
+            output,
+            ProductizeText(await File.ReadAllTextAsync(source, cancellationToken), product),
+            cancellationToken);
+        return output;
     }
 
     public string GetSelinuxDependencyInputSha256()
@@ -132,7 +228,21 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
     }
 
     public async Task<ArchLocalPackageRepository> ArchPackageAsync(string version, CancellationToken cancellationToken = default)
+        => await ArchPackageAsync(
+            version,
+            SystemImageBuildDescriptor.LoadDefaultPlan(_root, version),
+            cancellationToken);
+
+    public async Task<ArchLocalPackageRepository> ArchPackageAsync(
+        string version,
+        SystemImageBuildPlan plan,
+        CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(plan);
+        if (!string.Equals(version, plan.Version, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException($"package version {version} does not match system plan {plan.Version}");
+        }
         RequireSafeVersion(version);
         RequireNormalPackageBuilder("arch-package");
 
@@ -143,17 +253,27 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
 
         var workRoot = Path.Combine(_root, ".work");
         var artifactsRoot = Path.Combine(_root, "artifacts");
+        var packageWorkSetting = ProductEnvironment(
+            plan.Product,
+            "PACKAGE_WORK",
+            Path.Combine(workRoot, "arch-package", version));
+        var packageOutputSetting = ProductEnvironment(
+            plan.Product,
+            "PACKAGE_OUTPUT",
+            Path.Combine(artifactsRoot, "packages", version));
         var packageWork = RequireManagedBuildPath(
-            Env.String("HOMEHARBOR_PACKAGE_WORK", Path.Combine(workRoot, "arch-package", version)),
-            "HOMEHARBOR_PACKAGE_WORK",
+            packageWorkSetting.Value!,
+            packageWorkSetting.Name,
             workRoot);
         var packageOutput = RequireManagedBuildPath(
-            Env.String("HOMEHARBOR_PACKAGE_OUTPUT", Path.Combine(artifactsRoot, "packages", version)),
-            "HOMEHARBOR_PACKAGE_OUTPUT",
+            packageOutputSetting.Value!,
+            packageOutputSetting.Name,
             workRoot,
             artifactsRoot);
         RequireSeparateDirectories(packageWork, packageOutput, "package work and output");
-        var configuredDependencyCache = Env.Optional("HOMEHARBOR_SELINUX_DEPENDENCY_CACHE");
+        var configuredDependencyCache = plan.Security.Selinux
+            ? ProductEnvironment(plan.Product, "SELINUX_DEPENDENCY_CACHE", null).Value
+            : null;
         var dependencyCache = string.IsNullOrWhiteSpace(configuredDependencyCache)
             ? null
             : Path.GetFullPath(configuredDependencyCache);
@@ -171,7 +291,7 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
 
         var sourceDir = Path.Combine(packageWork, "source");
         var buildDir = Path.Combine(packageWork, "makepkg");
-        var sourceTarball = Path.Combine(sourceDir, $"homeharbor-{version}.tar.gz");
+        var sourceTarball = Path.Combine(sourceDir, $"{plan.Product.PackagePrefix}-{version}.tar.gz");
 
         await DeleteMappedBuildPathAsync(packageWork, cancellationToken);
         await DeleteMappedBuildPathAsync(packageOutput, cancellationToken);
@@ -179,48 +299,58 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
         _ = Directory.CreateDirectory(buildDir);
         _ = Directory.CreateDirectory(packageOutput);
 
-        var selinuxSourceSha256 = ArchPackageSetProvenance.ComputeSelinuxSourceSha256(_root);
-        if (dependencyCache is null)
+        string? selinuxSourceSha256 = null;
+        if (plan.Security.Selinux)
         {
-            var dependencyOutput = Path.Combine(packageWork, "selinux-packages");
-            _ = Directory.CreateDirectory(dependencyOutput);
-            var dependencyInputSha256 = GetSelinuxDependencyInputSha256();
-            await new SelinuxPackageBuilder(_root, _runner).BuildAsync(
-                SelinuxPackageBuildDescriptor.LoadDefaultPlan(_root),
-                Path.Combine(packageWork, "selinux"),
-                dependencyOutput,
-                cancellationToken);
-            await SelinuxDependencyPackageSetProvenance.WriteAsync(
+            selinuxSourceSha256 = ArchPackageSetProvenance.ComputeSelinuxSourceSha256(_root);
+            if (dependencyCache is null)
+            {
+                var dependencyOutput = Path.Combine(packageWork, "selinux-packages");
+                _ = Directory.CreateDirectory(dependencyOutput);
+                var dependencyInputSha256 = GetSelinuxDependencyInputSha256();
+                await new SelinuxPackageBuilder(_root, _runner).BuildAsync(
+                    SelinuxPackageBuildDescriptor.LoadDefaultPlan(_root),
+                    Path.Combine(packageWork, "selinux"),
+                    dependencyOutput,
+                    cancellationToken);
+                await SelinuxDependencyPackageSetProvenance.WriteAsync(
+                    _root,
+                    dependencyOutput,
+                    dependencyInputSha256,
+                    _runner,
+                    cancellationToken);
+                dependencyCache = dependencyOutput;
+            }
+
+            await SelinuxDependencyPackageSetProvenance.ImportVerifiedAsync(
                 _root,
-                dependencyOutput,
-                dependencyInputSha256,
+                dependencyCache,
+                packageOutput,
                 _runner,
                 cancellationToken);
-            dependencyCache = dependencyOutput;
         }
 
-        await SelinuxDependencyPackageSetProvenance.ImportVerifiedAsync(
-            _root,
-            dependencyCache,
-            packageOutput,
-            _runner,
+        await CreateCleanSourceArchiveAsync(
+            sourceDir,
+            sourceTarball,
+            plan.Product.PackagePrefix,
+            version,
             cancellationToken);
 
-        await CreateCleanSourceArchiveAsync(sourceDir, sourceTarball, version, cancellationToken);
-
-        var packagingTarball = Path.Combine(_root, "packaging", "arch", $"homeharbor-{version}.tar.gz");
+        var packagingTarball = Path.Combine(_root, "packaging", "arch", $"{plan.Product.PackagePrefix}-{version}.tar.gz");
         if (File.Exists(packagingTarball))
         {
             File.Delete(packagingTarball);
         }
 
+        var environmentPrefix = plan.Product.EnvironmentPrefix;
         var environment = new Dictionary<string, string>
         {
             ["DOTNET_CLI_HOME"] = Path.Combine(packageWork, "home", ".dotnet"),
             ["HOME"] = Path.Combine(packageWork, "home"),
-            ["HOMEHARBOR_VERSION"] = version,
-            ["HOMEHARBOR_CHANNEL"] = Env.String("HOMEHARBOR_CHANNEL", ReleaseChannel.Dev),
-            ["HOMEHARBOR_SOURCE_TARBALL"] = sourceTarball,
+            [environmentPrefix + "_VERSION"] = version,
+            [environmentPrefix + "_CHANNEL"] = ProductEnvironment(plan.Product, "CHANNEL", ReleaseChannel.Dev).Value!,
+            [environmentPrefix + "_SOURCE_TARBALL"] = sourceTarball,
             ["LOGNAME"] = Environment.UserName,
             ["NUGET_PACKAGES"] = Path.Combine(packageWork, "nuget-packages"),
             ["PKGDEST"] = packageOutput,
@@ -236,9 +366,12 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
             workingDirectory: Path.Combine(_root, "packaging", "arch"),
             environment: environment);
 
-        await ArchPackageArchiveValidator.ValidateHomeHarborPackagesAsync(
+        await BuildProductKernelPackagesAsync(plan, packageOutput, cancellationToken);
+
+        await ArchPackageArchiveValidator.ValidatePackagesAsync(
             packageOutput,
             version,
+            [plan.Product.ControlPackage, plan.Product.RecoveryPackage, plan.Product.InstallerPackage],
             _runner,
             cancellationToken);
 
@@ -247,21 +380,42 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
             Console.WriteLine(package);
         }
 
-        await ArchPackageSetProvenance.WriteAsync(
-            _root,
-            version,
-            packageOutput,
-            selinuxSourceSha256,
-            cancellationToken);
+        if (plan.Security.Selinux && string.Equals(plan.Product.Id, "homeharbor", StringComparison.Ordinal))
+        {
+            await ArchPackageSetProvenance.WriteAsync(
+                _root,
+                version,
+                packageOutput,
+                selinuxSourceSha256!,
+                cancellationToken);
+        }
+        else
+        {
+            await ArchProductPackageSetProvenance.WriteAsync(
+                _root,
+                plan,
+                packageOutput,
+                cancellationToken);
+        }
 
         return await ArchLocalPackageRepositoryBuilder.CreateAsync(
             packageOutput,
             Path.Combine(packageWork, "repository"),
             _runner,
+            plan.Product.LocalRepository,
             cancellationToken);
     }
 
     public async Task GenerateEfiAvbPublicKeyHeaderAsync(string output, CancellationToken cancellationToken = default)
+        => await GenerateEfiAvbPublicKeyHeaderAsync(
+            output,
+            SystemImageBuildDescriptor.LoadDefaultPlan(_root, "0.0.0").Product,
+            cancellationToken);
+
+    public async Task GenerateEfiAvbPublicKeyHeaderAsync(
+        string output,
+        SystemImageProductPlan product,
+        CancellationToken cancellationToken = default)
     {
         await RequireToolsAsync(["avbtool", "openssl"], cancellationToken);
         var fullOutput = Path.GetFullPath(output);
@@ -270,10 +424,10 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
         try
         {
             var encodedKey = Path.Combine(work, "homeharbor-avb-public-key.avbpub");
-            var publicKey = Env.Optional("HOMEHARBOR_AVB_PUBLIC_KEY");
+            var publicKey = ProductBuildEnvironment.Optional(product, "AVB_PUBLIC_KEY");
             if (!string.IsNullOrWhiteSpace(publicKey))
             {
-                RequireFile(publicKey, "HOMEHARBOR_AVB_PUBLIC_KEY does not point to a readable file");
+                RequireFile(publicKey, "AVB public key does not point to a readable file");
                 if (IsEncodedAvbPublicKey(publicKey))
                 {
                     File.Copy(publicKey, encodedKey, overwrite: true);
@@ -285,25 +439,24 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
             }
             else
             {
-                var secureBootKey = Env.Optional("HOMEHARBOR_SECURE_BOOT_KEY");
-                if (!string.IsNullOrWhiteSpace(secureBootKey))
+                var avbPrivateKey = ProductBuildEnvironment.Optional(product, "AVB_PRIVATE_KEY");
+                if (string.IsNullOrWhiteSpace(avbPrivateKey) &&
+                    string.Equals(product.Id, "homeharbor", StringComparison.Ordinal))
                 {
-                    RequireFile(secureBootKey, "HOMEHARBOR_SECURE_BOOT_KEY does not point to a readable file");
-                    await RunRequiredAsync("avbtool", ["extract_public_key", "--key", secureBootKey, "--output", encodedKey], cancellationToken);
+                    // Schema-one compatibility only. New product profiles must
+                    // use an AVB-specific key and never couple it to Secure Boot.
+                    avbPrivateKey = Env.Optional("HOMEHARBOR_SECURE_BOOT_KEY");
+                }
+                if (!string.IsNullOrWhiteSpace(avbPrivateKey))
+                {
+                    RequireFile(avbPrivateKey, "AVB private key does not point to a readable file");
+                    await RunRequiredAsync("avbtool", ["extract_public_key", "--key", avbPrivateKey, "--output", encodedKey], cancellationToken);
                 }
                 else
                 {
-                    var cert = Env.String("HOMEHARBOR_SECURE_BOOT_CERT", Path.Combine(_root, "certs", "homeharbor-secure-boot.crt"));
-                    RequireFile(cert, "no AVB public key source found; set HOMEHARBOR_AVB_PUBLIC_KEY or HOMEHARBOR_SECURE_BOOT_KEY");
-                    var pem = Path.Combine(work, "secure-boot-public.pem");
-                    var result = await _runner.RunAsync(
-                        "openssl",
-                        ["x509", "-in", cert, "-pubkey", "-noout"],
-                        new CommandRunOptions(StreamError: true),
-                        cancellationToken);
-                    _ = result.EnsureSuccess("openssl x509 failed");
-                    await File.WriteAllTextAsync(pem, result.Stdout, cancellationToken);
-                    await RunRequiredAsync("avbtool", ["extract_public_key", "--key", pem, "--output", encodedKey], cancellationToken);
+                    throw new InvalidOperationException(
+                        $"no AVB public key source found; set ARCH_AB_AVB_PUBLIC_KEY, {product.EnvironmentPrefix}_AVB_PUBLIC_KEY, " +
+                        $"ARCH_AB_AVB_PRIVATE_KEY, or {product.EnvironmentPrefix}_AVB_PRIVATE_KEY");
                 }
             }
 
@@ -339,6 +492,54 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
 
         _ = builder.AppendLine("};");
         return builder.ToString();
+    }
+
+    internal static string RenderProductHeader(
+        SystemImageProductPlan product,
+        SystemImageSecurityPlan security)
+    {
+        static string Wide(string value, string label)
+        {
+            if (value.Any(character => character is < ' ' or > '~' || character is '"'))
+            {
+                throw new InvalidOperationException(label + " must contain printable ASCII without quotes");
+            }
+
+            return "L\"" + value.Replace("\\", "\\\\", StringComparison.Ordinal) + "\"";
+        }
+
+        static string EfiGuidInitializer(string value)
+        {
+            if (!Guid.TryParse(value, out var guid))
+            {
+                throw new InvalidOperationException("product efiVendorGuid must be a GUID");
+            }
+
+            var segments = guid.ToString("D").ToUpperInvariant().Split('-');
+            var data4 = segments[3] + segments[4];
+            var bytes = Enumerable.Range(0, 8)
+                .Select(index => string.Concat("0x".AsSpan(), data4.AsSpan(index * 2, 2)));
+            return "{0x" + segments[0] + ", 0x" + segments[1] + ", 0x" + segments[2] +
+                ", {" + string.Join(", ", bytes) + "}}";
+        }
+
+        var efiPath = "\\" + product.EfiDirectory.Replace('/', '\\') + "\\";
+        var bootStatePath = "\\" + product.BootStatePath.Replace('/', '\\');
+        return $"""
+            #include <stdint.h>
+            #define ARCH_AB_PRODUCT_NAME {Wide(product.DisplayName, "product display name")}
+            #define ARCH_AB_BOOT_STATE_PATH {Wide(bootStatePath, "product boot state path")}
+            #define ARCH_AB_CACHE_PATH {Wide(efiPath + "current.efi", "product EFI directory")}
+            #define ARCH_AB_BOOT_NEXT_NAME {Wide(product.EfiVariablePrefix + "BootNext", "EFI variable prefix")}
+            #define ARCH_AB_BOOT_CURRENT_NAME {Wide(product.EfiVariablePrefix + "BootCurrent", "EFI variable prefix")}
+            #define ARCH_AB_DATA_PASSPHRASE_NAME {Wide(product.EfiVariablePrefix + "DataPassphrase", "EFI variable prefix")}
+            #define ARCH_AB_DATA_UNLOCK_MODE_NAME {Wide(product.EfiVariablePrefix + "DataUnlockMode", "EFI variable prefix")}
+            #define ARCH_AB_VBMETA_WARNING_DISABLED_NAME {Wide(product.EfiVariablePrefix + "VbmetaPreflightWarningDisabled", "EFI variable prefix")}
+            #define ARCH_AB_SECURE_BOOT_WARNING_DISABLED_NAME {Wide(product.EfiVariablePrefix + "SecureBootWarningDisabled", "EFI variable prefix")}
+            #define ARCH_AB_EFI_VENDOR_GUID {EfiGuidInitializer(product.EfiVendorGuid)}
+            #define ARCH_AB_WARN_SECURE_BOOT {(security.SecureBoot ? 1 : 0)}
+            #define ARCH_AB_AVB_FAIL_CLOSED {(security.AvbFailClosed ? 1 : 0)}
+            """ + "\n";
     }
 
     private static bool IsEncodedAvbPublicKey(string path)
@@ -446,6 +647,7 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
     private async Task CreateCleanSourceArchiveAsync(
         string sourceDirectory,
         string sourceTarball,
+        string packagePrefix,
         string version,
         CancellationToken cancellationToken)
     {
@@ -454,17 +656,17 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
             ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
             new CommandRunOptions(WorkingDirectory: _root, StreamError: true),
             cancellationToken);
-        _ = listed.EnsureSuccess("could not enumerate clean HomeHarbor source inputs");
+        _ = listed.EnsureSuccess("could not enumerate clean product source inputs");
 
         var sourcePaths = SelectCleanSourcePaths(
             _root,
             listed.Stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries));
         if (sourcePaths.Count == 0)
         {
-            throw new InvalidOperationException("clean HomeHarbor source input set is empty");
+            throw new InvalidOperationException("clean product source input set is empty");
         }
 
-        var stageName = "homeharbor-" + version;
+        var stageName = packagePrefix + "-" + version;
         var stage = Path.Combine(sourceDirectory, stageName);
         CopyTrackedTree(_root, stage, sourcePaths);
         await CopyInitializedSubmodulesAsync(stage, cancellationToken);
@@ -596,6 +798,64 @@ public sealed class BuildToolCommands(string root, ICommandRunner? runner = null
         }
 
         return result.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+    }
+
+    private static (string Name, string? Value) ProductEnvironment(
+        SystemImageProductPlan product,
+        string suffix,
+        string? defaultValue)
+    {
+        var genericName = "ARCH_AB_" + suffix;
+        var productName = product.EnvironmentPrefix + "_" + suffix;
+        var generic = Environment.GetEnvironmentVariable(genericName);
+        if (!string.IsNullOrWhiteSpace(generic))
+        {
+            return (genericName, generic);
+        }
+
+        var productValue = Environment.GetEnvironmentVariable(productName);
+        return !string.IsNullOrWhiteSpace(productValue)
+            ? (productName, productValue)
+            : (productName, defaultValue);
+    }
+
+    private async Task BuildProductKernelPackagesAsync(
+        SystemImageBuildPlan plan,
+        string packageOutput,
+        CancellationToken cancellationToken)
+    {
+        var kernelRoot = Path.Combine(_root, "system", plan.Architecture, "kernel");
+        if (!Directory.Exists(kernelRoot))
+        {
+            if (string.Equals(plan.Product.Id, "homeharbor", StringComparison.Ordinal))
+            {
+                return;
+            }
+            throw new DirectoryNotFoundException("product kernel manifest root not found: " + kernelRoot);
+        }
+
+        var kernelPlan = KernelPackageBuildDescriptor.LoadPlan(kernelRoot, _root, plan.Version);
+        var channel = kernelPlan.Channels.SingleOrDefault(item => string.Equals(item.Name, plan.KernelChannel, StringComparison.Ordinal))
+            ?? throw new InvalidOperationException($"system kernelChannel {plan.KernelChannel} has no kernel manifest");
+        if (!plan.Packages.Rootfs.Contains(channel.Kernel.Package, StringComparer.Ordinal) ||
+            !plan.Packages.Recovery.Contains(channel.Kernel.Package, StringComparer.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"kernel package {channel.Kernel.Package} must be present in rootfs and recovery package plans");
+        }
+
+        var archBuilds = channel.ArtifactBuilds.Where(build => build.Type == "arch-pkgbuild").ToArray();
+        if (archBuilds.Length == 0)
+        {
+            return;
+        }
+        if (archBuilds.Length != 1)
+        {
+            throw new InvalidOperationException($"kernel channel {channel.Name} must declare at most one arch-pkgbuild");
+        }
+
+        _ = await new KernelPackageBuilder(_root, plan.Version, channel, _runner)
+            .BuildArchPkgbuildAsync(packageOutput, cancellationToken);
     }
 
     private async Task RequireToolsAsync(IEnumerable<string> tools, CancellationToken cancellationToken)

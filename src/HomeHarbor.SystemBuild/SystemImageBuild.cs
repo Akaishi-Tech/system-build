@@ -8,6 +8,9 @@ public sealed record SystemImageBuildPlan(
     string Version,
     string Architecture,
     string BootMode,
+    SystemImageProductPlan Product,
+    SystemImageSecurityPlan Security,
+    string KernelChannel,
     SystemImagePackagesPlan Packages,
     SystemImageRootPlan Rootfs,
     SystemImageRootPlan Recovery,
@@ -20,6 +23,41 @@ public sealed record SystemImageBuildPlan(
 public sealed record SystemImagePackagesPlan(
     IReadOnlyList<string> Rootfs,
     IReadOnlyList<string> Recovery);
+
+public sealed record SystemImageProductPlan(
+    string Id,
+    string DisplayName,
+    string PackagePrefix,
+    string ServicePrefix,
+    string EfiDirectory,
+    string BootStatePath,
+    string KernelParameterPrefix,
+    string LocalRepository,
+    string ControlPackage,
+    string RecoveryPackage,
+    string InstallerPackage,
+    string InstallerEntryPoint,
+    string EnvironmentPrefix = "HOMEHARBOR",
+    string EfiVariablePrefix = "HomeHarbor",
+    string EfiVendorGuid = EfiBootVariables.VendorGuid)
+{
+    public ArchAbProductProfile ToArchAbProfile()
+        => new(
+            Id,
+            DisplayName,
+            EfiDirectory,
+            BootStatePath,
+            KernelParameterPrefix,
+            EnvironmentPrefix,
+            EfiVariablePrefix,
+            EfiVendorGuid);
+}
+
+public sealed record SystemImageSecurityPlan(
+    bool Selinux,
+    bool SecureBoot,
+    bool Avb,
+    bool AvbFailClosed);
 
 public sealed record SystemImageRootPlan(
     string Hostname,
@@ -84,6 +122,7 @@ public sealed record SystemImagePartitionPlan(
     string Label,
     string Size,
     long? SizeBytes,
+    long? MinimumSizeBytes,
     long? DataSizeBytes,
     string FileSystem,
     string Purpose,
@@ -142,7 +181,7 @@ public sealed partial class SystemImageBuildDescriptor
     [GeneratedRegex("^[A-Za-z0-9@._+-]+$")]
     private static partial Regex SafeNamePattern();
 
-    [GeneratedRegex("^[A-Za-z0-9._/+-]+$")]
+    [GeneratedRegex("^[A-Za-z0-9@._/+-]+$")]
     private static partial Regex SafeRelativePathPattern();
 
     [GeneratedRegex("^0[0-7]{3}$")]
@@ -158,6 +197,12 @@ public sealed partial class SystemImageBuildDescriptor
     public string? Architecture { get; set; }
 
     public string? BootMode { get; set; }
+
+    public SystemImageProductDescriptor Product { get; set; } = new();
+
+    public SystemImageSecurityDescriptor Security { get; set; } = new();
+
+    public string? KernelChannel { get; set; }
 
     public SystemImagePackagesDescriptor Packages { get; set; } = new();
 
@@ -206,9 +251,9 @@ public sealed partial class SystemImageBuildDescriptor
 
     public SystemImageBuildPlan ToPlan(string root, string version)
     {
-        if (SchemaVersion != 1)
+        if (SchemaVersion is not (1 or 2))
         {
-            throw new InvalidOperationException("system image manifest requires schemaVersion=1");
+            throw new InvalidOperationException("system image manifest requires schemaVersion=1 or schemaVersion=2");
         }
 
         if (!string.Equals(RequireName(Name, "system image manifest name"), "system", StringComparison.Ordinal))
@@ -218,7 +263,14 @@ public sealed partial class SystemImageBuildDescriptor
 
         var architecture = RequireName(Architecture, "system image architecture");
         var bootMode = RequireName(BootMode, "system image boot mode");
-        var rawUkiBootMode = SecureBootAssets.BootMode();
+        var productPlan = Product.ToPlan(SchemaVersion);
+        var securityPlan = Security.ToPlan(SchemaVersion);
+        var kernelChannel = string.IsNullOrWhiteSpace(KernelChannel)
+            ? SchemaVersion == 1
+                ? "generic"
+                : throw new InvalidOperationException("system image kernelChannel is required for schemaVersion=2")
+            : RequireName(KernelChannel, "system image kernelChannel");
+        var rawUkiBootMode = securityPlan.SecureBoot ? "secure-boot-raw-uki" : "raw-uki";
         var packagePlan = Packages.ToPlan();
         var rootfsPlan = Rootfs.ToPlan(root, version, "rootfs");
         var recoveryPlan = Recovery.ToPlan(root, version, "recovery");
@@ -233,6 +285,9 @@ public sealed partial class SystemImageBuildDescriptor
             version,
             architecture,
             bootMode,
+            productPlan,
+            securityPlan,
+            kernelChannel,
             packagePlan,
             rootfsPlan,
             recoveryPlan,
@@ -269,6 +324,13 @@ public sealed partial class SystemImageBuildDescriptor
             path.Contains('\\')
             ? throw new InvalidOperationException($"{name} must be an absolute image path")
             : path;
+    }
+
+    internal static string RequireRelativePath(string? value, string name)
+    {
+        var path = RequireNonEmpty(value, name);
+        ValidateRelativePath(path, name);
+        return path;
     }
 
     internal static string RequireMode(string? value, string name)
@@ -346,6 +408,137 @@ public sealed partial class SystemImageBuildDescriptor
 
     internal static string SizeString(long? bytes)
         => bytes is null ? "remaining" : $"{bytes.Value / MiB}M";
+}
+
+public sealed class SystemImageProductDescriptor
+{
+    public string? Id { get; set; }
+
+    public string? DisplayName { get; set; }
+
+    public string? PackagePrefix { get; set; }
+
+    public string? ServicePrefix { get; set; }
+
+    public string? EfiDirectory { get; set; }
+
+    public string? BootStatePath { get; set; }
+
+    public string? KernelParameterPrefix { get; set; }
+
+    public string? LocalRepository { get; set; }
+
+    public string? ControlPackage { get; set; }
+
+    public string? RecoveryPackage { get; set; }
+
+    public string? InstallerPackage { get; set; }
+
+    public string? InstallerEntryPoint { get; set; }
+
+    public string? EnvironmentPrefix { get; set; }
+
+    public string? EfiVariablePrefix { get; set; }
+
+    public string? EfiVendorGuid { get; set; }
+
+    public SystemImageProductPlan ToPlan(int schemaVersion)
+    {
+        if (schemaVersion == 1 && string.IsNullOrWhiteSpace(Id))
+        {
+            return new SystemImageProductPlan(
+                "homeharbor",
+                "HomeHarbor",
+                "homeharbor",
+                "homeharbor",
+                "EFI/HomeHarbor",
+                "EFI/HomeHarbor/boot_state.json",
+                "homeharbor",
+                "homeharbor-local",
+                "homeharbor-control",
+                "homeharbor-recovery",
+                "homeharbor-installer",
+                "/usr/lib/homeharbor/installer/HomeHarbor.Installer",
+                "HOMEHARBOR",
+                "HomeHarbor",
+                EfiBootVariables.VendorGuid);
+        }
+
+        var id = SystemImageBuildDescriptor.RequireName(Id, "product id");
+        var packagePrefix = SystemImageBuildDescriptor.RequireName(PackagePrefix, "product packagePrefix");
+        var servicePrefix = SystemImageBuildDescriptor.RequireName(ServicePrefix, "product servicePrefix");
+        var kernelPrefix = SystemImageBuildDescriptor.RequireName(KernelParameterPrefix, "product kernelParameterPrefix");
+        var efiDirectory = SystemImageBuildDescriptor.RequireRelativePath(EfiDirectory, "product efiDirectory");
+        var bootStatePath = SystemImageBuildDescriptor.RequireRelativePath(BootStatePath, "product bootStatePath");
+        if (!bootStatePath.StartsWith(efiDirectory + "/", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("product bootStatePath must be below product efiDirectory");
+        }
+
+        var environmentPrefix = string.IsNullOrWhiteSpace(EnvironmentPrefix)
+            ? id.ToUpperInvariant().Replace('-', '_').Replace('.', '_')
+            : EnvironmentPrefix.Trim();
+        var efiVariablePrefix = string.IsNullOrWhiteSpace(EfiVariablePrefix)
+            ? new string((string.IsNullOrWhiteSpace(DisplayName) ? id : DisplayName)
+                .Where(char.IsAsciiLetterOrDigit)
+                .ToArray())
+            : EfiVariablePrefix.Trim();
+        var profile = new ArchAbProductProfile(
+            id,
+            string.IsNullOrWhiteSpace(DisplayName) ? id : DisplayName.Trim(),
+            efiDirectory,
+            bootStatePath,
+            kernelPrefix,
+            environmentPrefix,
+            efiVariablePrefix,
+            string.IsNullOrWhiteSpace(EfiVendorGuid) ? EfiBootVariables.VendorGuid : EfiVendorGuid.Trim())
+            .Validate();
+
+        return new SystemImageProductPlan(
+            id,
+            profile.DisplayName,
+            packagePrefix,
+            servicePrefix,
+            efiDirectory,
+            bootStatePath,
+            kernelPrefix,
+            SystemImageBuildDescriptor.RequireName(LocalRepository, "product localRepository"),
+            SystemImageBuildDescriptor.RequireName(ControlPackage, "product controlPackage"),
+            SystemImageBuildDescriptor.RequireName(RecoveryPackage, "product recoveryPackage"),
+            SystemImageBuildDescriptor.RequireName(InstallerPackage, "product installerPackage"),
+            SystemImageBuildDescriptor.RequirePath(InstallerEntryPoint ?? "", "product installerEntryPoint"),
+            profile.EnvironmentPrefix,
+            profile.EfiVariablePrefix,
+            profile.EfiVendorGuid);
+    }
+}
+
+public sealed class SystemImageSecurityDescriptor
+{
+    public bool? Selinux { get; set; }
+
+    public bool? SecureBoot { get; set; }
+
+    public bool Avb { get; set; } = true;
+
+    public bool AvbFailClosed { get; set; } = true;
+
+    public SystemImageSecurityPlan ToPlan(int schemaVersion)
+    {
+        if (schemaVersion == 2 && (Selinux is null || SecureBoot is null))
+        {
+            throw new InvalidOperationException("schemaVersion=2 requires explicit security.selinux and security.secureBoot values");
+        }
+
+        var selinux = Selinux ?? true;
+        var secureBoot = SecureBoot ?? SecureBootAssets.IsEnabled();
+        if (AvbFailClosed && !Avb)
+        {
+            throw new InvalidOperationException("security.avbFailClosed requires security.avb");
+        }
+
+        return new SystemImageSecurityPlan(selinux, secureBoot, Avb, AvbFailClosed);
+    }
 }
 
 public sealed class SystemImagePackagesDescriptor
@@ -573,6 +766,8 @@ public sealed class SystemImagePartitionDescriptor
 
     public string? Size { get; set; }
 
+    public long? MinimumSizeMib { get; set; }
+
     public long? DataSizeMib { get; set; }
 
     public string? FileSystem { get; set; }
@@ -588,6 +783,18 @@ public sealed class SystemImagePartitionDescriptor
         var size = sizeBytes is null
             ? (string.IsNullOrWhiteSpace(Size) ? throw new InvalidOperationException($"{name} partition size or sizeMib is required") : Size.Trim())
             : SystemImageBuildDescriptor.SizeString(sizeBytes);
+        if (sizeBytes is null && !string.Equals(size, "remaining", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException($"{name} partition variable size must be remaining");
+        }
+
+        var minimumSizeBytes = SystemImageBuildDescriptor.OptionalMibToBytes(
+            MinimumSizeMib,
+            $"{name} partition minimumSizeMib");
+        if (minimumSizeBytes is not null && sizeBytes is not null)
+        {
+            throw new InvalidOperationException($"{name} partition minimumSizeMib is only valid with size=remaining");
+        }
         var dataSizeBytes = SystemImageBuildDescriptor.OptionalMibToBytes(DataSizeMib, $"{name} partition dataSizeMib");
         if (dataSizeBytes is not null && sizeBytes is not null && dataSizeBytes > sizeBytes)
         {
@@ -605,6 +812,7 @@ public sealed class SystemImagePartitionDescriptor
             Label?.Trim() ?? name,
             size,
             sizeBytes,
+            minimumSizeBytes,
             dataSizeBytes,
             fileSystem,
             string.IsNullOrWhiteSpace(Purpose) ? name : Purpose.Trim(),

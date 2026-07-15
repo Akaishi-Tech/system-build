@@ -155,13 +155,25 @@ public sealed partial class ReleaseArtifactBuilder(
         }
 
         var channel = ReleaseChannel.Require(
-            Env.String("HOMEHARBOR_RELEASE_CHANNEL", Env.String("HOMEHARBOR_ISO_CHANNEL", Env.String("HOMEHARBOR_CHANNEL", ReleaseChannel.Dev))),
-            "release channel");
-        const string kernelChannel = "generic";
+            ProductBuildEnvironment.Optional(plan.Product, "RELEASE_CHANNEL")
+                ?? ProductBuildEnvironment.Optional(plan.Product, "ISO_CHANNEL")
+                ?? ProductBuildEnvironment.Optional(plan.Product, "CHANNEL")
+                ?? ReleaseChannel.Dev,
+            plan.Product.EnvironmentPrefix + " release channel");
+        var kernelChannel = plan.KernelChannel;
         var createdAt = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
-        var releaseSequence = ReleaseSequence.RequireEnvironment();
+        var releaseSequence = ReleaseSequence.RequireEnvironment(plan.Product.ToArchAbProfile());
 
-        await RequireToolsAsync(["bsdtar", "getfattr", "mkarchiso", "openssl", "repo-add"], cancellationToken);
+        var requiredTools = new List<string> { "bsdtar", "mkarchiso", "openssl", "repo-add" };
+        if (plan.Security.Selinux)
+        {
+            requiredTools.Add("getfattr");
+        }
+        else
+        {
+            requiredTools.AddRange(["fsck.erofs", "mkfs.erofs"]);
+        }
+        await RequireToolsAsync(requiredTools, cancellationToken);
         await DeleteManagedReleaseWorkDirectoryAsync(_root, _work, _runner, cancellationToken);
         _ = Directory.CreateDirectory(_work);
         DeleteIfExists(_releaseDirectory);
@@ -183,14 +195,20 @@ public sealed partial class ReleaseArtifactBuilder(
             releaseSequence,
             cancellationToken);
 
-        var iso = await BuildFullInstallerIsoAsync(channel, systemOta, kernelOta, payloadChannelFile, keys.PublicKey, cancellationToken);
+        var iso = await BuildFullInstallerIsoAsync(
+            channel,
+            systemOta,
+            kernelOta,
+            payloadChannelFile,
+            keys.PublicKey,
+            cancellationToken);
         var channelFile = await WriteChannelMetadataAsync(
             Path.Combine(_releaseDirectory, "channel-" + channel + ".json"),
             channel,
             systemOta,
             kernelChannel,
             kernelOta,
-            iso,
+            string.IsNullOrWhiteSpace(iso) ? null : iso,
             releaseSequence,
             cancellationToken);
         var latestChannelFile = await WriteChannelMetadataAsync(
@@ -199,12 +217,15 @@ public sealed partial class ReleaseArtifactBuilder(
             systemOta,
             kernelChannel,
             kernelOta,
-            iso,
+            string.IsNullOrWhiteSpace(iso) ? null : iso,
             releaseSequence,
             cancellationToken);
 
         Console.WriteLine("Built release artifacts in " + _releaseDirectory);
-        Console.WriteLine(iso);
+        if (!string.IsNullOrWhiteSpace(iso))
+        {
+            Console.WriteLine(iso);
+        }
         return new ReleaseArtifactBuildResult(_releaseDirectory, systemOta, kernelOta, channelFile, latestChannelFile, iso);
     }
 
@@ -212,10 +233,10 @@ public sealed partial class ReleaseArtifactBuilder(
         string channel,
         string createdAt,
         long releaseSequence,
-        ReleaseKeys keys,
+        ReleaseSigningKeys keys,
         CancellationToken cancellationToken)
     {
-        var top = "homeharbor-system-ota-" + version;
+        var top = plan.Product.PackagePrefix + "-system-ota-" + version;
         var root = Path.Combine(_work, "system-ota", top);
         _ = Directory.CreateDirectory(root);
 
@@ -237,7 +258,7 @@ public sealed partial class ReleaseArtifactBuilder(
             ["version"] = version,
             ["channel"] = channel,
             ["createdAt"] = createdAt,
-            ["bootMode"] = SecureBootAssets.BootMode(),
+            ["bootMode"] = plan.Security.SecureBoot ? "secure-boot-raw-uki" : "raw-uki",
             ["rootfsHash"] = await Sha256HexAsync(completeRoot, cancellationToken),
             ["vbmetaAHash"] = await Sha256HexAsync(plan.Artifacts.VbmetaA.Path, cancellationToken),
             ["vbmetaBHash"] = await Sha256HexAsync(plan.Artifacts.VbmetaB.Path, cancellationToken),
@@ -256,10 +277,10 @@ public sealed partial class ReleaseArtifactBuilder(
         string kernelChannel,
         string createdAt,
         long releaseSequence,
-        ReleaseKeys keys,
+        ReleaseSigningKeys keys,
         CancellationToken cancellationToken)
     {
-        var top = "homeharbor-kernel-" + kernelChannel + "-ota-" + version;
+        var top = plan.Product.PackagePrefix + "-kernel-" + kernelChannel + "-ota-" + version;
         var root = Path.Combine(_work, "kernel-ota", top);
         _ = Directory.CreateDirectory(root);
 
@@ -279,12 +300,13 @@ public sealed partial class ReleaseArtifactBuilder(
         await CopyReleaseFileAsync(plan.Artifacts.Boot.Path, Path.Combine(root, "boot.efi"), cancellationToken);
         await CopyShaAsync(plan.Artifacts.Boot.Path, Path.Combine(root, "boot.efi.sha256"), cancellationToken);
 
-        await CopyReleaseFileAsync(plan.Artifacts.Bootloader.Path, Path.Combine(root, "HomeHarborBoot.efi"), cancellationToken);
-        await CopyShaAsync(plan.Artifacts.Bootloader.Path, Path.Combine(root, "HomeHarborBoot.efi.sha256"), cancellationToken);
+        var selectorName = Path.GetFileName(plan.Artifacts.Bootloader.Path);
+        await CopyReleaseFileAsync(plan.Artifacts.Bootloader.Path, Path.Combine(root, selectorName), cancellationToken);
+        await CopyShaAsync(plan.Artifacts.Bootloader.Path, Path.Combine(root, selectorName + ".sha256"), cancellationToken);
         await CopyReleaseFileAsync(plan.Artifacts.Bootx64.Path, Path.Combine(root, "BOOTX64.EFI"), cancellationToken);
         await CopyShaAsync(plan.Artifacts.Bootx64.Path, Path.Combine(root, "BOOTX64.EFI.sha256"), cancellationToken);
         var mokManager = Path.Combine(_imageWork, "mnt", "EFI", "BOOT", "mmx64.efi");
-        if (SecureBootAssets.IsEnabled())
+        if (plan.Security.SecureBoot)
         {
             RequireFile(mokManager, "secure boot MokManager artifact not found; run system-build with Secure Boot enabled");
             await CopyOptionalReleaseFileWithShaAsync(
@@ -305,12 +327,13 @@ public sealed partial class ReleaseArtifactBuilder(
             ["channel"] = channel,
             ["kernelChannel"] = kernelChannel,
             ["createdAt"] = createdAt,
-            ["bootMode"] = SecureBootAssets.BootMode(),
+            ["bootMode"] = plan.Security.SecureBoot ? "secure-boot-raw-uki" : "raw-uki",
             ["kernelRelease"] = ResolveKernelRelease(),
             ["modulesHash"] = await Sha256HexAsync(completeModules, cancellationToken),
             ["firmwareHash"] = await Sha256HexAsync(completeFirmware, cancellationToken),
             ["recoveryHash"] = await Sha256HexAsync(completeRecovery, cancellationToken),
             ["bootHash"] = await Sha256HexAsync(plan.Artifacts.Boot.Path, cancellationToken),
+            ["bootloaderFile"] = selectorName,
             ["bootloaderHash"] = await Sha256HexAsync(plan.Artifacts.Bootloader.Path, cancellationToken),
             ["fallbackBootHash"] = await Sha256HexAsync(plan.Artifacts.Bootx64.Path, cancellationToken)
         };
@@ -367,19 +390,23 @@ public sealed partial class ReleaseArtifactBuilder(
             .ToArray();
         await RunAsync(
             "repo-add",
-            ["homeharbor-local.db.tar.gz", .. packageArchives!],
+            [plan.Product.LocalRepository + ".db.tar.gz", .. packageArchives!],
             cancellationToken,
             packageDirectory);
 
         var isoWork = Path.Combine(_work, "mkarchiso");
-        var erofs = await SelinuxErofsTool.CreateAsync(
-            packageDirectory,
-            Path.Combine(_work, "live-installer-erofs-tool"),
-            _runner,
-            cancellationToken);
-        var erofsWrapperDirectory = await erofs.CreatePathWrappersAsync(
-            Path.Combine(_work, "live-installer-erofs-path"),
-            cancellationToken);
+        var erofsToolDirectory = "/usr/bin";
+        if (plan.Security.Selinux)
+        {
+            var erofs = await SelinuxErofsTool.CreateAsync(
+                packageDirectory,
+                Path.Combine(_work, "live-installer-erofs-tool"),
+                _runner,
+                cancellationToken);
+            erofsToolDirectory = await erofs.CreatePathWrappersAsync(
+                Path.Combine(_work, "live-installer-erofs-path"),
+                cancellationToken);
+        }
 
         var profile = Path.Combine(_work, "iso-profile");
         CopyDirectory("/usr/share/archiso/configs/baseline", profile);
@@ -398,7 +425,7 @@ public sealed partial class ReleaseArtifactBuilder(
         _ = Directory.CreateDirectory(isoOut);
         try
         {
-            await RunMkarchisoAsync(isoWork, isoOut, profile, erofsWrapperDirectory, cancellationToken);
+            await RunMkarchisoAsync(isoWork, isoOut, profile, erofsToolDirectory, cancellationToken);
 
             var builtIso = Directory.GetFiles(isoOut, "*.iso", SearchOption.TopDirectoryOnly)
                 .OrderByDescending(File.GetLastWriteTimeUtc)
@@ -406,18 +433,22 @@ public sealed partial class ReleaseArtifactBuilder(
                 ?? throw new InvalidOperationException("mkarchiso did not produce an ISO in " + isoOut);
             await ValidateLiveInstallerIsoAsync(
                 builtIso,
-                erofsWrapperDirectory,
-                Path.Combine(
-                    _imageWork,
-                    "rootfs",
-                    "usr",
-                    "lib",
-                    "homeharbor",
-                    "selinux-store",
-                    "refpolicy-arch"),
+                erofsToolDirectory,
+                plan.Security.Selinux
+                    ? Path.Combine(
+                        _imageWork,
+                        "rootfs",
+                        "usr",
+                        "lib",
+                        "homeharbor",
+                        "selinux-store",
+                        "refpolicy-arch")
+                    : null,
                 systemOta,
                 cancellationToken);
-            var finalIso = Path.Combine(_releaseDirectory, "homeharbor-full-live-installer-" + channel + "-" + version + ".iso");
+            var finalIso = Path.Combine(
+                _releaseDirectory,
+                plan.Product.PackagePrefix + "-full-live-installer-" + channel + "-" + version + ".iso");
             File.Move(builtIso, finalIso, overwrite: true);
             await WriteShaFileAsync(finalIso, finalIso + ".sha256", cancellationToken);
             return finalIso;
@@ -503,30 +534,35 @@ public sealed partial class ReleaseArtifactBuilder(
         string channel,
         CancellationToken cancellationToken)
     {
-        var liveRootfsFileContexts = Path.Combine(
-            Path.GetFullPath(isoWork),
-            "x86_64",
-            "airootfs",
-            "etc",
-            "selinux",
-            "refpolicy-arch",
-            "contexts",
-            "files",
-            "file_contexts");
-        var erofsOptions = string.Join(
-            ' ',
-            LiveInstallerErofsOptions(liveRootfsFileContexts)
-                .Select(SelinuxErofsTool.BashSingleQuote));
+        var erofsOptions = plan.Security.Selinux
+            ? string.Join(
+                ' ',
+                LiveInstallerErofsOptions(Path.Combine(
+                        Path.GetFullPath(isoWork),
+                        "x86_64",
+                        "airootfs",
+                        "etc",
+                        "selinux",
+                        "refpolicy-arch",
+                        "contexts",
+                        "files",
+                        "file_contexts"))
+                    .Select(SelinuxErofsTool.BashSingleQuote))
+            : string.Join(
+                ' ',
+                BaselineLiveInstallerErofsOptions()
+                    .Select(SelinuxErofsTool.BashSingleQuote));
+        var installDirectory = LiveInstallerInstallDirectory();
         var profileDef = $$"""
             #!/usr/bin/env bash
             # shellcheck disable=SC2034
 
-            iso_name="homeharbor-full-live-installer-{{channel}}"
-            iso_label="{{IsoLabel(channel, version)}}"
-            iso_publisher="HomeHarbor <https://github.com/akaishi-tech/home-harbor>"
-            iso_application="HomeHarbor Full Live Installer"
-            iso_version="{{version}}"
-            install_dir="hh"
+            iso_name={{SelinuxErofsTool.BashSingleQuote(plan.Product.PackagePrefix + "-full-live-installer-" + channel)}}
+            iso_label={{SelinuxErofsTool.BashSingleQuote(IsoLabel(plan.Product.PackagePrefix, channel, version))}}
+            iso_publisher={{SelinuxErofsTool.BashSingleQuote(plan.Product.DisplayName)}}
+            iso_application={{SelinuxErofsTool.BashSingleQuote(plan.Product.DisplayName + " Full Live Installer")}}
+            iso_version={{SelinuxErofsTool.BashSingleQuote(version)}}
+            install_dir={{SelinuxErofsTool.BashSingleQuote(installDirectory)}}
             buildmodes=('iso')
             bootmodes=('bios.syslinux'
                        'uefi.grub')
@@ -545,8 +581,13 @@ public sealed partial class ReleaseArtifactBuilder(
 
         var packages = BuildLiveInstallerPackageList(
             await File.ReadAllLinesAsync(Path.Combine(profile, "packages.x86_64"), cancellationToken),
-            plan.Packages.Recovery);
-        ValidateLiveInstallerPackageList(string.Join('\n', packages));
+            plan.Packages.Recovery,
+            plan.Product,
+            plan.Security.Selinux);
+        ValidateLiveInstallerPackageList(
+            string.Join('\n', packages),
+            plan.Product,
+            plan.Security.Selinux);
         await FileWrites.AtomicWriteTextAsync(
             Path.Combine(profile, "packages.x86_64"),
             string.Join('\n', packages) + "\n",
@@ -556,26 +597,50 @@ public sealed partial class ReleaseArtifactBuilder(
         await ArchLocalPackageRepositoryBuilder.WritePacmanConfigAsync(
             Path.Combine(profile, "pacman.conf"),
             packageDirectory,
+            plan.Product.LocalRepository,
             cancellationToken);
 
-        foreach (var relativePath in LiveInstallerProfileBootConfigurationPaths)
+        if (plan.Security.Selinux)
         {
-            var path = Path.Combine(profile, relativePath.Replace('/', Path.DirectorySeparatorChar));
-            var contents = await File.ReadAllTextAsync(path, cancellationToken);
-            await FileWrites.AtomicWriteTextAsync(
-                path,
-                AddLiveInstallerSelinuxKernelArguments(contents),
-                0644,
-                cancellationToken);
+            foreach (var relativePath in LiveInstallerProfileBootConfigurationPaths)
+            {
+                var path = Path.Combine(profile, relativePath.Replace('/', Path.DirectorySeparatorChar));
+                var contents = await File.ReadAllTextAsync(path, cancellationToken);
+                await FileWrites.AtomicWriteTextAsync(
+                    path,
+                    AddLiveInstallerSelinuxKernelArguments(contents),
+                    0644,
+                    cancellationToken);
+            }
         }
 
-        var payloadDirectory = Path.Combine(profile, "airootfs", "opt", "homeharbor-installer", "payloads");
+        var payloadDirectory = Path.Combine(
+            profile,
+            "airootfs",
+            InstallerPayloadErofsDirectory().TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
         _ = Directory.CreateDirectory(payloadDirectory);
         await CopyReleaseFileAsync(systemOta, Path.Combine(payloadDirectory, Path.GetFileName(systemOta)), cancellationToken);
         await CopyReleaseFileAsync(kernelOta, Path.Combine(payloadDirectory, Path.GetFileName(kernelOta)), cancellationToken);
         await CopyReleaseFileAsync(channelFile, Path.Combine(payloadDirectory, Path.GetFileName(channelFile)), cancellationToken);
         await CopyReleaseFileAsync(publicKey, Path.Combine(payloadDirectory, "release.pub.pem"), cancellationToken);
-        await InstallLiveInstallerTrustAnchorAsync(profile, publicKey, cancellationToken);
+        await InstallLiveInstallerTrustAnchorAsync(profile, publicKey, plan.Product, cancellationToken);
+
+        var productProfileDirectory = Path.Combine(
+            profile,
+            "airootfs",
+            "usr",
+            "share",
+            plan.Product.PackagePrefix,
+            "system");
+        _ = Directory.CreateDirectory(productProfileDirectory);
+        plan.Product.ToArchAbProfile().Write(Path.Combine(productProfileDirectory, "arch-ab-product.json"));
+        var systemManifest = SystemImageBuildDescriptor.DefaultManifestPath(_root);
+        RequireFile(systemManifest, "system image manifest is missing for the live installer");
+        await FileWrites.CopyFileAsync(
+            systemManifest,
+            Path.Combine(productProfileDirectory, "manifest.yml"),
+            0644,
+            cancellationToken);
 
         await WriteLiveInstallerStartupAsync(profile, cancellationToken);
     }
@@ -594,6 +659,36 @@ public sealed partial class ReleaseArtifactBuilder(
             .Select(line => line.Trim())
             .Where(package => !string.Equals(package, "homeharbor-recovery", StringComparison.Ordinal))
             .Where(package => !ForbiddenGenericLiveInstallerPackages.Contains(package))
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    internal static IReadOnlyList<string> BuildLiveInstallerPackageList(
+        IEnumerable<string> baselinePackages,
+        IEnumerable<string> recoveryPackages,
+        SystemImageProductPlan product,
+        bool selinux)
+    {
+        ArgumentNullException.ThrowIfNull(product);
+        if (selinux)
+        {
+            if (!string.Equals(product.Id, "homeharbor", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "the SELinux live installer package profile currently supports only the HomeHarbor compatibility product");
+            }
+            return BuildLiveInstallerPackageList(baselinePackages, recoveryPackages);
+        }
+
+        ArgumentNullException.ThrowIfNull(baselinePackages);
+        ArgumentNullException.ThrowIfNull(recoveryPackages);
+        return baselinePackages
+            .Concat(recoveryPackages)
+            .Concat(["gpm", "mkinitcpio-archiso", product.InstallerPackage])
+            .Where(line => !string.IsNullOrWhiteSpace(line) && !line.TrimStart().StartsWith('#'))
+            .Select(line => line.Trim())
+            .Where(package => !string.Equals(package, product.RecoveryPackage, StringComparison.Ordinal))
             .Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal)
             .ToArray();
@@ -632,6 +727,58 @@ public sealed partial class ReleaseArtifactBuilder(
         {
             throw new InvalidOperationException(
                 "live installer resolved forbidden generic packages instead of SELinux variants: " + string.Join(", ", generic));
+        }
+    }
+
+    internal static void ValidateLiveInstallerPackageList(
+        string packageList,
+        SystemImageProductPlan product,
+        bool selinux)
+    {
+        ArgumentNullException.ThrowIfNull(product);
+        if (selinux)
+        {
+            ValidateLiveInstallerPackageList(packageList);
+            return;
+        }
+
+        ArgumentNullException.ThrowIfNull(packageList);
+        var installed = packageList
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Trim())
+            .Where(line => line.Length > 0 && line[0] != '#')
+            .Select(line => line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)[0])
+            .ToHashSet(StringComparer.Ordinal);
+        var required = new[] { "base", "mkinitcpio-archiso", product.InstallerPackage };
+        var missing = required.Where(package => !installed.Contains(package)).ToArray();
+        if (missing.Length > 0)
+        {
+            throw new InvalidOperationException(
+                "baseline live installer is missing required packages: " + string.Join(", ", missing));
+        }
+
+        var selinuxPackages = installed
+            .Where(package => package.Contains("selinux", StringComparison.OrdinalIgnoreCase))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (selinuxPackages.Length > 0)
+        {
+            throw new InvalidOperationException(
+                "security.selinux=false live installer must not request SELinux packages: " +
+                string.Join(", ", selinuxPackages));
+        }
+        if (!string.Equals(product.Id, "homeharbor", StringComparison.Ordinal))
+        {
+            var legacyPackages = installed
+                .Where(package => package.StartsWith("homeharbor-", StringComparison.Ordinal))
+                .Order(StringComparer.Ordinal)
+                .ToArray();
+            if (legacyPackages.Length > 0)
+            {
+                throw new InvalidOperationException(
+                    $"{product.DisplayName} live installer must not contain HomeHarbor product packages: " +
+                    string.Join(", ", legacyPackages));
+            }
         }
     }
 
@@ -703,6 +850,31 @@ public sealed partial class ReleaseArtifactBuilder(
         }
     }
 
+    internal static void ValidateBaselineLiveInstallerBootConfiguration(string path, string contents)
+    {
+        var kernelLines = contents
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .Where(IsLiveInstallerKernelArgumentLine)
+            .ToArray();
+        if (kernelLines.Length == 0)
+        {
+            throw new InvalidOperationException("live installer boot configuration has no Linux kernel command line: " + path);
+        }
+
+        foreach (var argument in kernelLines.SelectMany(line =>
+                     line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)))
+        {
+            if (string.Equals(argument, "selinux=1", StringComparison.Ordinal) ||
+                string.Equals(argument, "enforcing=1", StringComparison.Ordinal) ||
+                (argument.StartsWith("lsm=", StringComparison.Ordinal) &&
+                 argument[4..].Split(',').Contains("selinux", StringComparer.Ordinal)))
+            {
+                throw new InvalidOperationException(
+                    $"security.selinux=false live installer boot configuration {path} contains '{argument}'");
+            }
+        }
+    }
+
     private static string KernelArgumentKey(string argument)
     {
         var separator = argument.IndexOf('=');
@@ -727,7 +899,23 @@ public sealed partial class ReleaseArtifactBuilder(
         await FileWrites.CopyFileAsync(publicKey, destination, 0644, cancellationToken);
     }
 
-    private static async Task WriteLiveInstallerStartupAsync(string profile, CancellationToken cancellationToken)
+    internal static async Task InstallLiveInstallerTrustAnchorAsync(
+        string profile,
+        string publicKey,
+        SystemImageProductPlan product,
+        CancellationToken cancellationToken)
+    {
+        RequireFile(publicKey, "release public key not found");
+        var destination = Path.Combine(
+            profile,
+            "airootfs",
+            "etc",
+            product.PackagePrefix,
+            "release.pub.pem");
+        await FileWrites.CopyFileAsync(publicKey, destination, 0644, cancellationToken);
+    }
+
+    private async Task WriteLiveInstallerStartupAsync(string profile, CancellationToken cancellationToken)
     {
         var ttyDropIn = Path.Combine(profile, "airootfs", "etc", "systemd", "system", "getty@tty1.service.d", "autologin.conf");
         await FileWrites.AtomicWriteTextAsync(ttyDropIn, """
@@ -743,27 +931,94 @@ public sealed partial class ReleaseArtifactBuilder(
             ExecStart=-/usr/bin/agetty --autologin root --keep-baud 115200,57600,38400,9600 %I ${TERM}
             """.Replace("            ", string.Empty, StringComparison.Ordinal), cancellationToken: cancellationToken);
 
-        await FileWrites.AtomicWriteTextAsync(Path.Combine(profile, "airootfs", "root", ".bash_profile"), """
-            if [ -z "${HOMEHARBOR_INSTALLER_STARTED:-}" ]; then
+        string bashProfile;
+        string customize;
+        if (plan.Security.Selinux && string.Equals(plan.Product.Id, "homeharbor", StringComparison.Ordinal))
+        {
+            bashProfile = """
+                if [ -z "${HOMEHARBOR_INSTALLER_STARTED:-}" ]; then
+                  case "$(tty)" in
+                    /dev/tty1|/dev/ttyS0)
+                      export HOMEHARBOR_INSTALLER_STARTED=1
+                      export HOMEHARBOR_INSTALLER_TUI_COLOR_MODE=kernel-16
+                      export HOMEHARBOR_INSTALLER_TUI_SIZE_DETECTION=polling
+                      printf '\nHomeHarbor Live Installer\n\n'
+                      exec /usr/lib/homeharbor/installer/HomeHarbor.Installer --mode full --payload-dir /opt/homeharbor-installer/payloads
+                      ;;
+                  esac
+                fi
+                """.Replace("                ", string.Empty, StringComparison.Ordinal);
+            customize = """
+                #!/usr/bin/env bash
+                set -euo pipefail
+                systemctl enable serial-getty@ttyS0.service
+                systemctl enable getty@tty1.service
+                systemctl enable NetworkManager.service systemd-resolved.service qemu-guest-agent.service auditd.service
+                """.Replace("                ", string.Empty, StringComparison.Ordinal);
+        }
+        else
+        {
+            bashProfile = RenderGenericLiveInstallerBashProfile(
+                plan.Product,
+                InstallerPayloadErofsDirectory());
+            customize = """
+                #!/usr/bin/env bash
+                set -euo pipefail
+                systemctl enable serial-getty@ttyS0.service
+                systemctl enable getty@tty1.service
+                systemctl enable systemd-networkd.service systemd-resolved.service qemu-guest-agent.service
+                """.Replace("                ", string.Empty, StringComparison.Ordinal);
+
+            await FileWrites.AtomicWriteTextAsync(
+                Path.Combine(profile, "airootfs", "etc", "systemd", "network", "20-wired.network"),
+                """
+                [Match]
+                Type=ether
+
+                [Network]
+                DHCP=yes
+                IPv6AcceptRA=yes
+                """,
+                0644,
+                cancellationToken);
+        }
+
+        await FileWrites.AtomicWriteTextAsync(
+            Path.Combine(profile, "airootfs", "root", ".bash_profile"),
+            bashProfile,
+            0700,
+            cancellationToken);
+        await FileWrites.AtomicWriteTextAsync(
+            Path.Combine(profile, "airootfs", "root", "customize_airootfs.sh"),
+            customize,
+            0755,
+            cancellationToken);
+    }
+
+    internal static string RenderGenericLiveInstallerBashProfile(
+        SystemImageProductPlan product,
+        string payloadDirectory)
+    {
+        ArgumentNullException.ThrowIfNull(product);
+        ArgumentException.ThrowIfNullOrWhiteSpace(payloadDirectory);
+        var startedVariable = product.EnvironmentPrefix + "_INSTALLER_STARTED";
+        var installer = SelinuxErofsTool.BashSingleQuote(product.InstallerEntryPoint);
+        var displayName = SelinuxErofsTool.BashSingleQuote(product.DisplayName);
+        var payload = SelinuxErofsTool.BashSingleQuote(payloadDirectory);
+        return $$"""
+            if [ -z "$(printenv {{startedVariable}} 2>/dev/null)" ]; then
               case "$(tty)" in
                 /dev/tty1|/dev/ttyS0)
-                  export HOMEHARBOR_INSTALLER_STARTED=1
-                  export HOMEHARBOR_INSTALLER_TUI_COLOR_MODE=kernel-16
-                  export HOMEHARBOR_INSTALLER_TUI_SIZE_DETECTION=polling
-                  printf '\nHomeHarbor Live Installer\n\n'
-                  exec /usr/lib/homeharbor/installer/HomeHarbor.Installer --mode full --payload-dir /opt/homeharbor-installer/payloads
+                  export {{startedVariable}}=1
+                  printf '\n%s Live Installer\n\n' {{displayName}}
+                  {{installer}} list-disks || true
+                  printf '\nSigned payloads: %s\n' {{payload}}
+                  printf 'Run the installer command above with install options after selecting a whole disk.\n\n'
+                  exec /bin/bash
                   ;;
               esac
             fi
-            """.Replace("            ", string.Empty, StringComparison.Ordinal), 0700, cancellationToken);
-
-        await FileWrites.AtomicWriteTextAsync(Path.Combine(profile, "airootfs", "root", "customize_airootfs.sh"), """
-            #!/usr/bin/env bash
-            set -euo pipefail
-            systemctl enable serial-getty@ttyS0.service
-            systemctl enable getty@tty1.service
-            systemctl enable NetworkManager.service systemd-resolved.service qemu-guest-agent.service auditd.service
-            """.Replace("            ", string.Empty, StringComparison.Ordinal), 0755, cancellationToken);
+            """;
     }
 
     private async Task<string> WriteChannelMetadataAsync(
@@ -818,7 +1073,7 @@ public sealed partial class ReleaseArtifactBuilder(
     private async Task WriteSignedManifestAsync(
         string path,
         JsonObject manifest,
-        ReleaseKeys keys,
+        ReleaseSigningKeys keys,
         CancellationToken cancellationToken)
     {
         var unsigned = manifest.ToJsonString();
@@ -879,15 +1134,15 @@ public sealed partial class ReleaseArtifactBuilder(
             : Path.Combine(_root, "artifacts", "packages", version);
         if (!Directory.Exists(source))
         {
-            throw new DirectoryNotFoundException("HomeHarbor package directory not found; run system-build first: " + source);
+            throw new DirectoryNotFoundException(plan.Product.DisplayName + " package directory not found; run system-build first: " + source);
         }
 
         var destination = Path.Combine(_releaseDirectory, "packages");
-        await CopyVerifiedPackageSetAsync(_root, version, source, destination, cancellationToken);
+        await CopyVerifiedPackageSetAsync(_root, plan, source, destination, cancellationToken);
 
-        if (Directory.GetFiles(destination, "homeharbor-installer-*.pkg.tar.*").Length == 0)
+        if (Directory.GetFiles(destination, plan.Product.InstallerPackage + "-*.pkg.tar.*").Length == 0)
         {
-            throw new InvalidOperationException("release package set is missing homeharbor-installer");
+            throw new InvalidOperationException("release package set is missing " + plan.Product.InstallerPackage);
         }
     }
 
@@ -914,32 +1169,44 @@ public sealed partial class ReleaseArtifactBuilder(
         await ArchPackageSetProvenance.VerifyAsync(root, version, destination, cancellationToken);
     }
 
-    private async Task<ReleaseKeys> ResolveReleaseKeysAsync(string channel, CancellationToken cancellationToken)
+    internal static async Task CopyVerifiedPackageSetAsync(
+        string root,
+        SystemImageBuildPlan plan,
+        string source,
+        string destination,
+        CancellationToken cancellationToken)
     {
-        var privateKey = Env.Optional("HOMEHARBOR_RELEASE_PRIVATE_KEY");
-        var publicKey = Env.Optional("HOMEHARBOR_RELEASE_PUBLIC_KEY");
-        if (!string.IsNullOrWhiteSpace(privateKey) && !string.IsNullOrWhiteSpace(publicKey))
+        if (string.Equals(plan.Product.Id, "homeharbor", StringComparison.Ordinal) && plan.Security.Selinux)
         {
-            RequireFile(privateKey, "release private key not found");
-            RequireFile(publicKey, "release public key not found");
-            return new ReleaseKeys(privateKey, publicKey, Env.String("HOMEHARBOR_RELEASE_KEY_ID", channel + "-local"));
+            await CopyVerifiedPackageSetAsync(root, plan.Version, source, destination, cancellationToken);
+            return;
         }
 
-        if (channel != ReleaseChannel.Dev)
+        await ArchProductPackageSetProvenance.VerifyAsync(root, plan, source, cancellationToken);
+        _ = Directory.CreateDirectory(destination);
+        foreach (var package in Directory.GetFiles(source, "*.pkg.tar.*", SearchOption.TopDirectoryOnly)
+                     .Where(path => !path.EndsWith(".sig", StringComparison.Ordinal))
+                     .Order(StringComparer.Ordinal))
         {
-            throw new InvalidOperationException("HOMEHARBOR_RELEASE_PRIVATE_KEY and HOMEHARBOR_RELEASE_PUBLIC_KEY are required for " + channel + " releases");
+            await CopyReleaseFileAsync(package, Path.Combine(destination, Path.GetFileName(package)), cancellationToken);
         }
-
-        var keyDir = Path.Combine(_work, "dev-release-key");
-        _ = Directory.CreateDirectory(keyDir);
-        privateKey = Path.Combine(keyDir, "release.pem");
-        publicKey = Path.Combine(keyDir, "release.pub.pem");
-        await RunAsync("openssl", ["genpkey", "-algorithm", "Ed25519", "-out", privateKey], cancellationToken);
-        await RunAsync("openssl", ["pkey", "-in", privateKey, "-pubout", "-out", publicKey], cancellationToken);
-        await RunAsync("chmod", ["0600", privateKey], cancellationToken);
-        await RunAsync("chmod", ["0644", publicKey], cancellationToken);
-        return new ReleaseKeys(privateKey, publicKey, "dev-local");
+        await CopyReleaseFileAsync(
+            Path.Combine(source, ArchProductPackageSetProvenance.FileName),
+            Path.Combine(destination, ArchProductPackageSetProvenance.FileName),
+            cancellationToken);
+        await ArchProductPackageSetProvenance.VerifyAsync(root, plan, destination, cancellationToken);
     }
+
+    private Task<ReleaseSigningKeys> ResolveReleaseKeysAsync(
+        string channel,
+        CancellationToken cancellationToken)
+        => ReleaseBuildSigningCoordinator.ResolveAsync(
+            _root,
+            version,
+            plan.Product,
+            channel,
+            _runner,
+            cancellationToken);
 
     private async Task RunMkarchisoAsync(
         string work,
@@ -959,20 +1226,25 @@ public sealed partial class ReleaseArtifactBuilder(
     private async Task ValidateLiveInstallerIsoAsync(
         string iso,
         string erofsWrapperDirectory,
-        string expectedPolicyStore,
+        string? expectedPolicyStore,
         string systemOta,
         CancellationToken cancellationToken)
     {
-        _ = SelinuxPolicyStoreSynchronizer.RequireValidSeed(expectedPolicyStore);
-        RequireFile(systemOta, "system OTA is missing for live policy validation");
+        if (plan.Security.Selinux)
+        {
+            _ = SelinuxPolicyStoreSynchronizer.RequireValidSeed(
+                expectedPolicyStore ?? throw new InvalidOperationException("SELinux live installer validation requires a policy store"));
+        }
+        RequireFile(systemOta, "system OTA is missing for live installer validation");
         var rootPartitionBytes = plan.LogicalPartitions.Single(partition => partition.Name == "root_a").SizeBytes;
         var expectedSystemRootfs = RequireCompleteLogicalPairArtifact(_imageWork, "root", rootPartitionBytes);
+        var installDirectory = LiveInstallerInstallDirectory();
 
         var packageList = await CaptureAsync(
             "bsdtar",
-            ["-xOf", iso, "hh/pkglist.x86_64.txt"],
+            ["-xOf", iso, installDirectory + "/pkglist.x86_64.txt"],
             cancellationToken);
-        ValidateLiveInstallerPackageList(packageList);
+        ValidateLiveInstallerPackageList(packageList, plan.Product, plan.Security.Selinux);
 
         foreach (var relativePath in LiveInstallerIsoBootConfigurationPaths)
         {
@@ -980,7 +1252,14 @@ public sealed partial class ReleaseArtifactBuilder(
                 "bsdtar",
                 ["-xOf", iso, relativePath],
                 cancellationToken);
-            ValidateLiveInstallerBootConfiguration(relativePath, contents);
+            if (plan.Security.Selinux)
+            {
+                ValidateLiveInstallerBootConfiguration(relativePath, contents);
+            }
+            else
+            {
+                ValidateBaselineLiveInstallerBootConfiguration(relativePath, contents);
+            }
         }
 
         var validationRoot = Path.Combine(_work, "live-installer-iso-validation");
@@ -994,37 +1273,45 @@ public sealed partial class ReleaseArtifactBuilder(
                     iso,
                     "-C",
                     validationRoot,
-                    "hh/x86_64/airootfs.erofs"
+                    installDirectory + "/x86_64/airootfs.erofs"
                 ],
                 cancellationToken);
-            var image = Path.Combine(validationRoot, "hh", "x86_64", "airootfs.erofs");
+            var image = Path.Combine(validationRoot, installDirectory, "x86_64", "airootfs.erofs");
             RequireFile(image, "live installer EROFS image is missing from the ISO");
 
-            var installer = Path.Combine(validationRoot, "HomeHarbor.Installer");
+            var installer = Path.Combine(validationRoot, Path.GetFileName(plan.Product.InstallerEntryPoint));
+            var installerExtractArguments = new List<string>
+            {
+                "--extract=" + installer,
+                "--no-preserve"
+            };
+            if (plan.Security.Selinux)
+            {
+                installerExtractArguments.Add("--xattrs");
+            }
+            installerExtractArguments.Add("--path=" + plan.Product.InstallerEntryPoint);
+            installerExtractArguments.Add(image);
             await RunPrivilegedWithToolPathAsync(
                 erofsWrapperDirectory,
                 "fsck.erofs",
-                [
-                    "--extract=" + installer,
-                    "--no-preserve",
-                    "--xattrs",
-                    "--path=/usr/lib/homeharbor/installer/HomeHarbor.Installer",
-                    image
-                ],
+                installerExtractArguments,
                 cancellationToken,
                 timeout: TimeSpan.FromMinutes(10));
-            RequireFile(installer, "could not extract the live installer executable for SELinux validation");
+            RequireFile(installer, "could not extract the live installer executable for validation");
 
-            var context = await CaptureAsync(
-                "getfattr",
-                ["--only-values", "-n", "security.selinux", installer],
-                cancellationToken);
-            var normalizedContext = context.TrimEnd('\0', '\r', '\n');
-            const string expectedContext = "system_u:object_r:homeharbor_exec_t:s0";
-            if (!string.Equals(normalizedContext, expectedContext, StringComparison.Ordinal))
+            if (plan.Security.Selinux)
             {
-                throw new InvalidOperationException(
-                    $"live installer executable has SELinux context '{normalizedContext}', expected '{expectedContext}'");
+                var context = await CaptureAsync(
+                    "getfattr",
+                    ["--only-values", "-n", "security.selinux", installer],
+                    cancellationToken);
+                var normalizedContext = context.TrimEnd('\0', '\r', '\n');
+                const string expectedContext = "system_u:object_r:homeharbor_exec_t:s0";
+                if (!string.Equals(normalizedContext, expectedContext, StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        $"live installer executable has SELinux context '{normalizedContext}', expected '{expectedContext}'");
+                }
             }
 
             var embeddedSystemOta = Path.Combine(validationRoot, Path.GetFileName(systemOta));
@@ -1034,7 +1321,7 @@ public sealed partial class ReleaseArtifactBuilder(
                     "--extract=" + embeddedSystemOta,
                     "--no-preserve-owner",
                     "--preserve-perms",
-                    "--path=" + LiveInstallerPayloadErofsDirectory + "/" + Path.GetFileName(systemOta),
+                    "--path=" + InstallerPayloadErofsDirectory() + "/" + Path.GetFileName(systemOta),
                     image
                 ],
                 cancellationToken,
@@ -1059,47 +1346,51 @@ public sealed partial class ReleaseArtifactBuilder(
                 "system root logical image changed inside the embedded installer OTA",
                 cancellationToken);
 
-            var extractedSystemPolicyStore = Path.Combine(validationRoot, "system-policy-store");
-            await RunAsync(
-                Path.Combine(erofsWrapperDirectory, "fsck.erofs"),
-                [
-                    "--extract=" + extractedSystemPolicyStore,
-                    "--no-preserve-owner",
-                    "--preserve-perms",
-                    "--path=" + SystemPolicyStoreErofsPath,
-                    embeddedSystemRootfs
-                ],
-                cancellationToken,
-                timeout: TimeSpan.FromMinutes(10));
-            _ = SelinuxPolicyStoreSynchronizer.RequireValidSeed(extractedSystemPolicyStore);
-            await ValidateFileTreeContentAsync(
-                expectedPolicyStore,
-                extractedSystemPolicyStore,
-                "system EROFS immutable SELinux policy store",
-                cancellationToken);
+            if (plan.Security.Selinux)
+            {
+                var validatedPolicyStore = expectedPolicyStore!;
+                var extractedSystemPolicyStore = Path.Combine(validationRoot, "system-policy-store");
+                await RunAsync(
+                    Path.Combine(erofsWrapperDirectory, "fsck.erofs"),
+                    [
+                        "--extract=" + extractedSystemPolicyStore,
+                        "--no-preserve-owner",
+                        "--preserve-perms",
+                        "--path=" + SystemPolicyStoreErofsPath,
+                        embeddedSystemRootfs
+                    ],
+                    cancellationToken,
+                    timeout: TimeSpan.FromMinutes(10));
+                _ = SelinuxPolicyStoreSynchronizer.RequireValidSeed(extractedSystemPolicyStore);
+                await ValidateFileTreeContentAsync(
+                    validatedPolicyStore,
+                    extractedSystemPolicyStore,
+                    "system EROFS immutable SELinux policy store",
+                    cancellationToken);
 
-            var extractedPolicyModules = Path.Combine(validationRoot, "live-policy-modules");
-            await RunAsync(
-                Path.Combine(erofsWrapperDirectory, "fsck.erofs"),
-                [
-                    "--extract=" + extractedPolicyModules,
-                    "--no-preserve-owner",
-                    "--preserve-perms",
-                    "--path=" + LiveInstallerPolicyModulesErofsPath,
-                    image
-                ],
-                cancellationToken,
-                timeout: TimeSpan.FromMinutes(10));
-            await ValidateFileTreeContentAsync(
-                Path.Combine(expectedPolicyStore, "active", "modules"),
-                extractedPolicyModules,
-                "live installer SELinux module store",
-                cancellationToken);
-            await ValidateFileTreeContentAsync(
-                Path.Combine(extractedSystemPolicyStore, "active", "modules"),
-                extractedPolicyModules,
-                "system/live EROFS SELinux module store",
-                cancellationToken);
+                var extractedPolicyModules = Path.Combine(validationRoot, "live-policy-modules");
+                await RunAsync(
+                    Path.Combine(erofsWrapperDirectory, "fsck.erofs"),
+                    [
+                        "--extract=" + extractedPolicyModules,
+                        "--no-preserve-owner",
+                        "--preserve-perms",
+                        "--path=" + LiveInstallerPolicyModulesErofsPath,
+                        image
+                    ],
+                    cancellationToken,
+                    timeout: TimeSpan.FromMinutes(10));
+                await ValidateFileTreeContentAsync(
+                    Path.Combine(validatedPolicyStore, "active", "modules"),
+                    extractedPolicyModules,
+                    "live installer SELinux module store",
+                    cancellationToken);
+                await ValidateFileTreeContentAsync(
+                    Path.Combine(extractedSystemPolicyStore, "active", "modules"),
+                    extractedPolicyModules,
+                    "system/live EROFS SELinux module store",
+                    cancellationToken);
+            }
         }
         finally
         {
@@ -1117,7 +1408,7 @@ public sealed partial class ReleaseArtifactBuilder(
         long expectedBytes,
         CancellationToken cancellationToken)
     {
-        var expectedMember = "homeharbor-system-ota-" + version + "/rootfs.img";
+        var expectedMember = plan.Product.PackagePrefix + "-system-ota-" + version + "/rootfs.img";
         await using var input = File.OpenRead(systemOta);
         await using var gzip = new GZipStream(input, CompressionMode.Decompress);
         using var reader = new TarReader(gzip);
@@ -1178,6 +1469,17 @@ public sealed partial class ReleaseArtifactBuilder(
             "--file-contexts=" + Path.GetFullPath(fileContexts)
         ];
     }
+
+    internal static IReadOnlyList<string> BaselineLiveInstallerErofsOptions()
+        => ["-zlzma,109", "-E", "ztailpacking"];
+
+    private string LiveInstallerInstallDirectory()
+        => plan.Security.Selinux && string.Equals(plan.Product.Id, "homeharbor", StringComparison.Ordinal)
+            ? "hh"
+            : plan.Product.PackagePrefix;
+
+    private string InstallerPayloadErofsDirectory()
+        => "/opt/" + plan.Product.InstallerPackage + "/payloads";
 
     internal static async Task ValidateFileTreeContentAsync(
         string expectedRoot,
@@ -1415,8 +1717,9 @@ public sealed partial class ReleaseArtifactBuilder(
     {
         foreach (var candidate in new[]
                  {
-                     Path.Combine(_root, "artifacts", "homeharbor-avb"),
-                     Path.Combine(_imageWork, "homeharbor-avb")
+                     Path.Combine(_root, "artifacts", plan.Product.PackagePrefix + "-avb"),
+                     Path.Combine(_imageWork, "arch-ab-avb"),
+                     Path.Combine(_imageWork, "product-boot-tools", plan.Product.PackagePrefix + "-avb")
                  })
         {
             if (File.Exists(candidate))
@@ -1425,7 +1728,7 @@ public sealed partial class ReleaseArtifactBuilder(
             }
         }
 
-        throw new FileNotFoundException("homeharbor-avb helper not found; run system-build first");
+        throw new FileNotFoundException("product AVB helper not found; run system-build first");
     }
 
     private static async Task CreateTarGzAsync(string sourceDirectory, string topDirectory, string output, CancellationToken cancellationToken)
@@ -1627,9 +1930,9 @@ public sealed partial class ReleaseArtifactBuilder(
         }
     }
 
-    private static string IsoLabel(string channel, string version)
+    private static string IsoLabel(string product, string channel, string version)
     {
-        var value = ("HH_" + channel + "_" + version).ToUpperInvariant();
+        var value = (product + "_" + channel + "_" + version).ToUpperInvariant();
         var builder = new StringBuilder();
         foreach (var c in value)
         {
@@ -1681,5 +1984,4 @@ public sealed partial class ReleaseArtifactBuilder(
             IntPtr buffer);
     }
 
-    private sealed record ReleaseKeys(string PrivateKey, string PublicKey, string KeyId);
 }

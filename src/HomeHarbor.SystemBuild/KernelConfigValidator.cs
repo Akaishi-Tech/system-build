@@ -13,15 +13,19 @@ internal static class KernelConfigValidator
         "CONFIG_SECURITY",
         "CONFIG_SECURITYFS",
         "CONFIG_SECURITY_NETWORK",
-        "CONFIG_SECURITY_SELINUX",
-        "CONFIG_SECURITY_SELINUX_BOOTPARAM",
         "CONFIG_AUDIT",
         "CONFIG_AUDITSYSCALL",
-        "CONFIG_EROFS_FS_XATTR",
-        "CONFIG_EROFS_FS_SECURITY",
-        "CONFIG_EXT4_FS_SECURITY",
         "CONFIG_TMPFS",
         "CONFIG_TMPFS_XATTR"
+    ];
+
+    private static readonly string[] SelinuxRequiredOptions =
+    [
+        "CONFIG_SECURITY_SELINUX",
+        "CONFIG_SECURITY_SELINUX_BOOTPARAM",
+        "CONFIG_EROFS_FS_XATTR",
+        "CONFIG_EROFS_FS_SECURITY",
+        "CONFIG_EXT4_FS_SECURITY"
     ];
 
     internal static async Task ValidateAsync(
@@ -29,10 +33,18 @@ internal static class KernelConfigValidator
         string workDirectory,
         ICommandRunner runner,
         CancellationToken cancellationToken)
+        => await ValidateAsync(kernelImage, workDirectory, runner, true, cancellationToken);
+
+    internal static async Task ValidateAsync(
+        string kernelImage,
+        string workDirectory,
+        ICommandRunner runner,
+        bool requireSelinux,
+        CancellationToken cancellationToken)
     {
         if (!File.Exists(kernelImage) || new FileInfo(kernelImage).Length == 0)
         {
-            throw new InvalidOperationException("missing nonempty kernel image for SELinux config validation: " + kernelImage);
+            throw new InvalidOperationException("missing nonempty kernel image for appliance config validation: " + kernelImage);
         }
 
         var image = await File.ReadAllBytesAsync(kernelImage, cancellationToken);
@@ -49,20 +61,23 @@ internal static class KernelConfigValidator
                 $"kernel image {kernelImage} does not contain an extractable CONFIG_IKCONFIG payload");
         }
 
-        ValidateConfig(config, kernelImage);
+        ValidateConfig(config, kernelImage, requireSelinux);
     }
 
-    internal static void ValidateConfig(string config, string label)
+    internal static void ValidateConfig(string config, string label, bool requireSelinux = true)
     {
         var enabled = config.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(line => line.EndsWith("=y", StringComparison.Ordinal))
             .Select(line => line[..^2])
             .ToHashSet(StringComparer.Ordinal);
-        var missing = RequiredOptions.Where(option => !enabled.Contains(option)).ToArray();
+        var required = requireSelinux
+            ? RequiredOptions.Concat(SelinuxRequiredOptions)
+            : RequiredOptions;
+        var missing = required.Where(option => !enabled.Contains(option)).ToArray();
         if (missing.Length > 0)
         {
             throw new InvalidOperationException(
-                $"kernel config {label} is missing required SELinux filesystem security options: {string.Join(", ", missing)}");
+                $"kernel config {label} is missing required appliance security options: {string.Join(", ", missing)}");
         }
     }
 

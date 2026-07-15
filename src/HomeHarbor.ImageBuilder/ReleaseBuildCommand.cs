@@ -20,8 +20,16 @@ internal static partial class ImageBuilderProgram
                 parseResult.GetValue(manifestArgument)!,
                 repoRoot,
                 version);
-            await new SystemImageBuilder(repoRoot, version, systemPlan).BuildAsync(cancellationToken);
-            _ = await new ReleaseArtifactBuilder(repoRoot, version, systemPlan).BuildAsync(cancellationToken);
+            await ReleaseBuildSigningCoordinator.RunAsync(
+                repoRoot,
+                version,
+                systemPlan,
+                ct => new SystemImageBuilder(repoRoot, version, systemPlan).BuildAsync(ct),
+                async ct =>
+                {
+                    _ = await new ReleaseArtifactBuilder(repoRoot, version, systemPlan).BuildAsync(ct);
+                },
+                cancellationToken: cancellationToken);
             return 0;
         });
         return command;

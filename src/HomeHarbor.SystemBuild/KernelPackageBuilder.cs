@@ -1,5 +1,9 @@
 namespace HomeHarbor.Tooling;
 
+internal sealed record ArchPkgbuildPrerequisites(
+    IReadOnlyList<string> ValidPgpKeys,
+    IReadOnlyList<string> MakeDependencies);
+
 public sealed class KernelPackageBuilder(
     string root,
     string version,
@@ -40,8 +44,459 @@ public sealed class KernelPackageBuilder(
         {
             "zfs-lts-artifacts" => BuildZfsLtsArtifactsAsync(cancellationToken),
             "zfs-utils-addon" => BuildZfsUtilsAddonAsync(addon ?? throw new InvalidOperationException("zfs-utils addon build requires an addon"), cancellationToken),
+            "arch-pkgbuild" => BuildArchPkgbuildAsync(
+                channel.Kernel.Source?.PackageOutput ?? Path.Combine(_root, "artifacts", "kernel-packages", version, channel.Name),
+                cancellationToken),
             _ => throw new InvalidOperationException($"unsupported kernel package build type: {build.Type}")
         };
+
+    public async Task<IReadOnlyList<string>> BuildArchPkgbuildAsync(
+        string packageOutput,
+        CancellationToken cancellationToken = default)
+    {
+        if (channel.Kernel.Origin != "source-build")
+        {
+            throw new InvalidOperationException("arch-pkgbuild requires kernel origin=source-build");
+        }
+        var source = channel.Kernel.Source
+            ?? throw new InvalidOperationException("arch-pkgbuild requires a pinned kernel source");
+        if (string.IsNullOrWhiteSpace(source.GitUrl) ||
+            string.IsNullOrWhiteSpace(source.GitRef) ||
+            source.GitRef.Length != 40 ||
+            !source.GitRef.All(Uri.IsHexDigit))
+        {
+            throw new InvalidOperationException("arch-pkgbuild requires gitUrl and a full 40-hex gitRef");
+        }
+
+        var checkout = source.Path ?? Path.Combine(_work, "source");
+        var managedRoot = Path.Combine(_root, ".work");
+        if (!SecurityGuards.IsInsideDirectory(checkout, managedRoot) ||
+            string.Equals(Path.GetFullPath(checkout), Path.GetFullPath(managedRoot), StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("arch-pkgbuild source path must be a child of the repository .work directory");
+        }
+
+        await _rootless.RequireReadyAsync(cancellationToken);
+        foreach (var tool in new[] { "git", "makepkg", "updpkgsums", "bsdtar", "pacman" })
+        {
+            await NeedAsync(tool, cancellationToken);
+        }
+        await DeleteWorkDirectoryAsync(checkout, cancellationToken);
+        _ = Directory.CreateDirectory(Path.GetDirectoryName(checkout)!);
+        await RunAsync(
+            "git",
+            ["clone", "--filter=blob:none", "--no-checkout", source.GitUrl, checkout],
+            cancellationToken);
+        await RunAsync(
+            "git",
+            ["-C", checkout, "checkout", "--detach", source.GitRef],
+            cancellationToken);
+        var head = (await CaptureAsync(
+            "git",
+            ["-C", checkout, "rev-parse", "HEAD"],
+            cancellationToken)).Trim();
+        if (!string.Equals(head, source.GitRef, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"kernel checkout resolved to {head}, not pinned ref {source.GitRef}");
+        }
+
+        var pkgbuild = Path.Combine(checkout, "PKGBUILD");
+        var config = Path.Combine(checkout, "config");
+        if (!File.Exists(pkgbuild) || !File.Exists(config))
+        {
+            throw new InvalidOperationException("Arch kernel packaging checkout must contain PKGBUILD and config");
+        }
+        RewriteKernelPackageBase(pkgbuild, channel.Kernel.Package);
+        MergeKernelConfig(config, channel.ConfigFragments);
+        ValidateRequiredKernelConfig(config, channel.RequiredConfig);
+        await RunAsCurrentUserAsync("updpkgsums", [], cancellationToken, workingDirectory: checkout);
+
+        var output = Path.GetFullPath(packageOutput);
+        _ = Directory.CreateDirectory(output);
+        var buildRoot = Path.Combine(_work, "makepkg");
+        var gnupgHome = Path.Combine(_work, "gnupg");
+        await DeleteWorkDirectoryAsync(gnupgHome, cancellationToken);
+        _ = Directory.CreateDirectory(buildRoot);
+        _ = Directory.CreateDirectory(gnupgHome);
+        File.SetUnixFileMode(
+            gnupgHome,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var environment = new Dictionary<string, string>
+        {
+            ["BUILDDIR"] = buildRoot,
+            ["GNUPGHOME"] = gnupgHome,
+            ["HOME"] = Path.Combine(_work, "home"),
+            ["LOGNAME"] = Environment.UserName,
+            ["PKGDEST"] = output,
+            ["SRCDEST"] = Path.Combine(_work, "sources"),
+            ["USER"] = Environment.UserName,
+            ["XDG_CACHE_HOME"] = Path.Combine(_work, "home", ".cache")
+        };
+        _ = Directory.CreateDirectory(environment["HOME"]);
+        _ = Directory.CreateDirectory(environment["SRCDEST"]);
+        var sourceInfo = await _runner.RunAsync(
+            "makepkg",
+            ["--printsrcinfo"],
+            RootlessBuildExecutor.IsolatedOptions(new CommandRunOptions(
+                WorkingDirectory: checkout,
+                StreamError: true,
+                Timeout: TimeSpan.FromMinutes(1),
+                EnvironmentOverride: environment)),
+            cancellationToken);
+        _ = sourceInfo.EnsureSuccess("could not read Arch kernel PKGBUILD metadata");
+        var prerequisites = ParseArchPkgbuildPrerequisites(
+            sourceInfo.Stdout,
+            CurrentMakepkgArchitecture());
+        if (prerequisites.ValidPgpKeys.Count > 0)
+        {
+            await NeedAsync("gpg", cancellationToken);
+            await ImportExactArchPgpKeysAsync(
+                prerequisites.ValidPgpKeys,
+                checkout,
+                gnupgHome,
+                environment,
+                cancellationToken);
+        }
+        await RequireArchMakeDependenciesAsync(
+            prerequisites.MakeDependencies,
+            environment,
+            cancellationToken);
+
+        var result = await _runner.RunAsync(
+            "makepkg",
+            ["--force", "--cleanbuild", "--clean", "--nodeps", "--noconfirm"],
+            RootlessBuildExecutor.IsolatedOptions(new CommandRunOptions(
+                WorkingDirectory: checkout,
+                StreamOutput: true,
+                StreamError: true,
+                EnvironmentOverride: environment)),
+            cancellationToken);
+        _ = result.EnsureSuccess("Arch linux-lts PKGBUILD failed");
+
+        var packages = Directory.GetFiles(output, channel.Kernel.Package + "-*.pkg.tar.*", SearchOption.TopDirectoryOnly)
+            .Where(path => !path.EndsWith(".sig", StringComparison.Ordinal))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (packages.Length == 0)
+        {
+            throw new InvalidOperationException($"arch-pkgbuild produced no {channel.Kernel.Package} package archives");
+        }
+        await ValidateBuiltKernelConfigAsync(packages, cancellationToken);
+        return packages;
+    }
+
+    internal static ArchPkgbuildPrerequisites ParseArchPkgbuildPrerequisites(
+        string sourceInfo,
+        string architecture)
+    {
+        if (string.IsNullOrWhiteSpace(architecture) || architecture.Any(char.IsWhiteSpace))
+        {
+            throw new InvalidOperationException("makepkg architecture is invalid");
+        }
+
+        var validPgpKeys = new List<string>();
+        var makeDependencies = new List<string>();
+        foreach (var raw in sourceInfo.Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0 || line.StartsWith('#'))
+            {
+                continue;
+            }
+
+            var equals = line.IndexOf('=');
+            if (equals <= 0)
+            {
+                continue;
+            }
+
+            var key = line[..equals].Trim();
+            var value = line[(equals + 1)..].Trim();
+            if (key == "validpgpkeys")
+            {
+                validPgpKeys.Add(NormalizeFullOpenPgpFingerprint(value));
+            }
+            else if (key == "makedepends" || key == "makedepends_" + architecture)
+            {
+                if (value.Length == 0 || value[0] == '-' || value.Any(char.IsWhiteSpace) || value.Any(char.IsControl))
+                {
+                    throw new InvalidOperationException("PKGBUILD contains an invalid makedepends entry");
+                }
+                makeDependencies.Add(value);
+            }
+        }
+
+        return new ArchPkgbuildPrerequisites(
+            validPgpKeys.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray(),
+            makeDependencies.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray());
+    }
+
+    internal static IReadOnlyList<string> ParsePrimaryOpenPgpFingerprints(string colonOutput)
+    {
+        var fingerprints = new List<string>();
+        var awaitingPrimaryFingerprint = false;
+        foreach (var raw in colonOutput.Split('\n'))
+        {
+            var fields = raw.TrimEnd('\r').Split(':');
+            if (fields.Length == 0)
+            {
+                continue;
+            }
+
+            if (fields[0] == "pub")
+            {
+                awaitingPrimaryFingerprint = true;
+                continue;
+            }
+            if (fields[0] == "sub" || fields[0] == "sec" || fields[0] == "ssb")
+            {
+                awaitingPrimaryFingerprint = false;
+                continue;
+            }
+            if (awaitingPrimaryFingerprint && fields[0] == "fpr")
+            {
+                if (fields.Length <= 9)
+                {
+                    throw new InvalidOperationException("gpg returned a malformed primary-key fingerprint record");
+                }
+                fingerprints.Add(NormalizeFullOpenPgpFingerprint(fields[9]));
+                awaitingPrimaryFingerprint = false;
+            }
+        }
+
+        return fingerprints.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+    }
+
+    internal static void RequireExactPrimaryOpenPgpFingerprints(
+        IReadOnlyList<string> requested,
+        string colonOutput)
+    {
+        var expected = requested.Select(NormalizeFullOpenPgpFingerprint)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        var actual = ParsePrimaryOpenPgpFingerprints(colonOutput).ToArray();
+        if (!expected.SequenceEqual(actual, StringComparer.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "isolated OpenPGP keyring did not contain exactly the requested primary fingerprints; " +
+                "requested=" + string.Join(',', expected) + "; imported=" + string.Join(',', actual));
+        }
+    }
+
+    internal static void RequireSatisfiedMakeDependencies(
+        IReadOnlyList<string> requested,
+        CommandResult result)
+    {
+        if (result.ExitCode == 0)
+        {
+            return;
+        }
+
+        var missing = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        var detail = missing.Length > 0
+            ? string.Join(", ", missing)
+            : string.Join(", ", requested);
+        throw new InvalidOperationException(
+            "Arch kernel build prerequisites are not satisfied: " + detail + ". " +
+            "Install packages satisfying these makedepends expressions and rerun; " +
+            "makepkg --nodeps is intentionally gated by this preflight." +
+            (string.IsNullOrWhiteSpace(result.Stderr)
+                ? string.Empty
+                : Environment.NewLine + result.Stderr.Trim()));
+    }
+
+    private static string NormalizeFullOpenPgpFingerprint(string value)
+    {
+        var normalized = value.Trim().ToUpperInvariant();
+        if (normalized.Length is not (40 or 64) || !normalized.All(Uri.IsHexDigit))
+        {
+            throw new InvalidOperationException(
+                "validpgpkeys must contain full 40- or 64-hex OpenPGP fingerprints, not short key IDs");
+        }
+        return normalized;
+    }
+
+    private static string CurrentMakepkgArchitecture()
+        => System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture switch
+        {
+            System.Runtime.InteropServices.Architecture.X64 => "x86_64",
+            System.Runtime.InteropServices.Architecture.X86 => "i686",
+            System.Runtime.InteropServices.Architecture.Arm64 => "aarch64",
+            System.Runtime.InteropServices.Architecture.Arm => "armv7h",
+            var architecture => throw new InvalidOperationException(
+                "unsupported makepkg host architecture: " + architecture)
+        };
+
+    private async Task ImportExactArchPgpKeysAsync(
+        IReadOnlyList<string> fingerprints,
+        string checkout,
+        string gnupgHome,
+        IReadOnlyDictionary<string, string> environment,
+        CancellationToken cancellationToken)
+    {
+        foreach (var fingerprint in fingerprints)
+        {
+            var pinnedKeyFile = RootPathGuard.RequireChildPath(
+                Path.Combine(checkout, "keys", "pgp", fingerprint + ".asc"),
+                checkout,
+                "repository-pinned OpenPGP key");
+            if (!File.Exists(pinnedKeyFile))
+            {
+                throw new InvalidOperationException(
+                    "pinned Arch kernel packaging checkout does not contain a regular OpenPGP key file for " +
+                    fingerprint + ": " + pinnedKeyFile);
+            }
+
+            var import = await _runner.RunAsync(
+                "gpg",
+                [
+                    "--no-options",
+                    "--batch",
+                    "--homedir", gnupgHome,
+                    "--import", pinnedKeyFile
+                ],
+                RootlessBuildExecutor.IsolatedOptions(new CommandRunOptions(
+                    StreamOutput: true,
+                    StreamError: true,
+                    Timeout: TimeSpan.FromMinutes(2),
+                    EnvironmentOverride: environment)),
+                cancellationToken);
+            _ = import.EnsureSuccess(
+                "could not import repository-pinned OpenPGP fingerprint " + fingerprint);
+        }
+
+        var listed = await _runner.RunAsync(
+            "gpg",
+            ["--no-options", "--batch", "--homedir", gnupgHome, "--with-colons", "--fingerprint", "--list-keys"],
+            RootlessBuildExecutor.IsolatedOptions(new CommandRunOptions(
+                StreamError: true,
+                Timeout: TimeSpan.FromMinutes(1),
+                EnvironmentOverride: environment)),
+            cancellationToken);
+        _ = listed.EnsureSuccess("could not verify the isolated OpenPGP keyring");
+        RequireExactPrimaryOpenPgpFingerprints(fingerprints, listed.Stdout);
+    }
+
+    private async Task RequireArchMakeDependenciesAsync(
+        IReadOnlyList<string> dependencies,
+        IReadOnlyDictionary<string, string> environment,
+        CancellationToken cancellationToken)
+    {
+        if (dependencies.Count == 0)
+        {
+            return;
+        }
+
+        var result = await _runner.RunAsync(
+            "pacman",
+            ["-T", "--", .. dependencies],
+            RootlessBuildExecutor.IsolatedOptions(new CommandRunOptions(
+                StreamError: true,
+                Timeout: TimeSpan.FromMinutes(1),
+                EnvironmentOverride: environment)),
+            cancellationToken);
+        RequireSatisfiedMakeDependencies(dependencies, result);
+    }
+
+    private static void RewriteKernelPackageBase(string pkgbuild, string packageName)
+    {
+        var lines = File.ReadAllLines(pkgbuild).ToList();
+        var index = lines.FindIndex(line => line.StartsWith("pkgbase=", StringComparison.Ordinal));
+        if (index < 0)
+        {
+            throw new InvalidOperationException("Arch kernel PKGBUILD has no pkgbase assignment");
+        }
+        lines[index] = "pkgbase=" + packageName;
+        File.WriteAllLines(pkgbuild, lines);
+    }
+
+    private static void MergeKernelConfig(string configPath, IReadOnlyList<string> fragments)
+    {
+        var values = ParseKernelConfig(File.ReadAllLines(configPath));
+        foreach (var fragment in fragments)
+        {
+            if (!File.Exists(fragment))
+            {
+                throw new FileNotFoundException("kernel config fragment not found", fragment);
+            }
+            foreach (var (key, value) in ParseKernelConfig(File.ReadAllLines(fragment)))
+            {
+                values[key] = value;
+            }
+        }
+
+        File.WriteAllLines(
+            configPath,
+            values.OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                .Select(pair => pair.Value == "n" ? $"# {pair.Key} is not set" : $"{pair.Key}={pair.Value}"));
+    }
+
+    private static Dictionary<string, string> ParseKernelConfig(IEnumerable<string> lines)
+    {
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var raw in lines)
+        {
+            var line = raw.Trim();
+            if (line.StartsWith("# CONFIG_", StringComparison.Ordinal) && line.EndsWith(" is not set", StringComparison.Ordinal))
+            {
+                var key = line[2..^11];
+                result[key] = "n";
+                continue;
+            }
+            var equals = line.IndexOf('=');
+            if (equals > 0 && line.StartsWith("CONFIG_", StringComparison.Ordinal))
+            {
+                result[line[..equals]] = line[(equals + 1)..];
+            }
+        }
+        return result;
+    }
+
+    private static void ValidateRequiredKernelConfig(string configPath, IReadOnlyList<string> required)
+    {
+        var values = ParseKernelConfig(File.ReadLines(configPath));
+        foreach (var requirement in required)
+        {
+            var equals = requirement.IndexOf('=');
+            var key = requirement[..equals];
+            var value = requirement[(equals + 1)..];
+            if (!values.TryGetValue(key, out var actual) || !string.Equals(actual, value, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException($"kernel config requires {requirement}, got {key}={actual ?? "missing"}");
+            }
+        }
+    }
+
+    private async Task ValidateBuiltKernelConfigAsync(
+        IReadOnlyList<string> packages,
+        CancellationToken cancellationToken)
+    {
+        var headers = packages.FirstOrDefault(path => Path.GetFileName(path).StartsWith(channel.Kernel.Package + "-headers-", StringComparison.Ordinal));
+        if (headers is null)
+        {
+            throw new InvalidOperationException("arch-pkgbuild did not produce the kernel headers archive needed for config validation");
+        }
+        var result = await _runner.RunAsync(
+            "bsdtar",
+            ["-tf", headers],
+            cancellationToken: cancellationToken);
+        _ = result.EnsureSuccess("could not inspect built kernel headers archive");
+        var configMember = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault(path => path.EndsWith("/build/.config", StringComparison.Ordinal))
+            ?? throw new InvalidOperationException("built kernel headers archive has no .config");
+        var config = await _runner.RunAsync(
+            "bsdtar",
+            ["-xOf", headers, configMember],
+            cancellationToken: cancellationToken);
+        _ = config.EnsureSuccess("could not extract built kernel config");
+        var temp = Path.Combine(_work, "validated.config");
+        await File.WriteAllTextAsync(temp, config.Stdout, cancellationToken);
+        ValidateRequiredKernelConfig(temp, channel.RequiredConfig);
+    }
 
     private async Task BuildZfsLtsArtifactsAsync(CancellationToken cancellationToken)
     {
@@ -208,7 +663,12 @@ public sealed class KernelPackageBuilder(
             recoveryDataMountPoint.FullName,
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
             UnixFileMode.GroupRead | UnixFileMode.GroupExecute);
-        await File.WriteAllTextAsync(Path.Combine(recoveryRootfs, "etc", "fstab"), "LABEL=state /var ext4 defaults 0 2\nLABEL=esp /efi vfat umask=0077,nofail,x-systemd.device-timeout=30s 0 2\n", cancellationToken);
+        await File.WriteAllTextAsync(
+            Path.Combine(recoveryRootfs, "etc", "fstab"),
+            SystemImageBuilder.RenderPlanFstab(SystemImageBuilder.MergeRecoveryFstab(
+                systemPlan.Rootfs.Fstab,
+                systemPlan.Recovery.Fstab)),
+            cancellationToken);
         await File.WriteAllTextAsync(Path.Combine(recoveryRootfs, "etc", "hostname"), "homeharbor-recovery\n", cancellationToken);
         var shells = Path.Combine(recoveryRootfs, "etc", "shells");
         var shell = "/usr/lib/homeharbor/recovery/HomeHarbor.Recovery";
@@ -598,6 +1058,20 @@ public sealed class KernelPackageBuilder(
         {
             _ = result.EnsureSuccess();
         }
+    }
+
+    private async Task<string> CaptureAsync(
+        string fileName,
+        IEnumerable<string> arguments,
+        CancellationToken cancellationToken)
+    {
+        var result = await _runner.RunAsync(
+            fileName,
+            arguments,
+            new CommandRunOptions(StreamError: true),
+            cancellationToken);
+        _ = result.EnsureSuccess();
+        return result.Stdout;
     }
 
     private async Task RunPacstrapAsync(
