@@ -587,6 +587,9 @@ public sealed class SystemImageBuilder(
         ApplyPlanSubIds(plan.Recovery, recoveryRootfs);
         ApplyPlanLinger(plan.Recovery, recoveryRootfs);
         await EnablePlanUnitsAsync(plan.Recovery, recoveryRootfs, cancellationToken);
+        RewriteMkinitcpioHooks(
+            Path.Combine(recoveryRootfs, "etc", "mkinitcpio.conf"),
+            plan.Recovery.MkinitcpioHooks);
     }
 
     private async Task InstallAvbTrustAnchorsAsync(
@@ -1822,7 +1825,7 @@ public sealed class SystemImageBuilder(
         => plan.Partitions.Single(partition => partition.Name == name).DataSizeBytes
             ?? throw new InvalidOperationException($"{name} partition has no dataSizeBytes");
 
-    private static void RewriteMkinitcpioHooks(string path, IReadOnlyList<string> hooks)
+    internal static void RewriteMkinitcpioHooks(string path, IReadOnlyList<string> hooks)
     {
         var lines = File.ReadAllLines(path);
         for (var i = 0; i < lines.Length; i++)
