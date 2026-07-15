@@ -597,13 +597,19 @@ public sealed class SystemImageRootDescriptor
     public List<string> SystemdUnits { get; set; } = [];
 
     public SystemImageRootPlan ToPlan(string root, string version, string name)
-        => new(
+    {
+        var mkinitcpioHooks = MkinitcpioHooks
+            .Select(hook => SystemImageBuildDescriptor.RequireName(hook, $"{name} mkinitcpio hook"))
+            .ToList();
+        ValidateMkinitcpioHooks(mkinitcpioHooks, name);
+
+        return new SystemImageRootPlan(
             SystemImageBuildDescriptor.RequireName(Hostname, $"{name} hostname"),
             Directories.Select((directory, index) => SystemImageBuildDescriptor.RequirePath(directory, $"{name} directory {index + 1}")).ToList(),
             Files.Select((file, index) => file.ToPlan(root, version, $"{name} file {index + 1}")).ToList(),
             Fstab.Select((entry, index) => entry.ToPlan($"{name} fstab entry {index + 1}")).ToList(),
             CreateEmptyCrypttab,
-            MkinitcpioHooks.Select(hook => SystemImageBuildDescriptor.RequireName(hook, $"{name} mkinitcpio hook")).ToList(),
+            mkinitcpioHooks,
             Users.Select((user, index) => user.ToPlan($"{name} user {index + 1}")).ToList(),
             GeneratedUsers.Select((user, index) => user.ToPlan($"{name} generated user {index + 1}")).ToList(),
             Groups.Select((group, index) => group.ToPlan($"{name} group {index + 1}")).ToList(),
@@ -611,6 +617,17 @@ public sealed class SystemImageRootDescriptor
             LingerUsers.Select(user => SystemImageBuildDescriptor.RequireName(user, $"{name} linger user")).ToList(),
             Shells.Select(shell => SystemImageBuildDescriptor.RequirePath(shell, $"{name} shell")).ToList(),
             SystemdUnits.Select(unit => SystemImageBuildDescriptor.RequireName(unit, $"{name} systemd unit")).ToList());
+    }
+
+    internal static void ValidateMkinitcpioHooks(IReadOnlyCollection<string> hooks, string name)
+    {
+        if (hooks.Contains("systemd", StringComparer.Ordinal) &&
+            hooks.Contains("arch-ab-verity", StringComparer.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"{name} mkinitcpio hooks cannot combine systemd with the traditional arch-ab-verity runtime hook");
+        }
+    }
 }
 
 public sealed class SystemImageFileDescriptor

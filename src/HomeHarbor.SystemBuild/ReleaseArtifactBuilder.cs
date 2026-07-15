@@ -242,12 +242,9 @@ public sealed partial class ReleaseArtifactBuilder(
 
         var rootPartitionBytes = plan.LogicalPartitions.Single(partition => partition.Name == "root_a").SizeBytes;
         var completeRoot = RequireCompleteLogicalPairArtifact(_imageWork, "root", rootPartitionBytes);
-        await CopyReleaseFileAsync(completeRoot, Path.Combine(root, "rootfs.img"), cancellationToken);
-        await CopyShaAsync(completeRoot, Path.Combine(root, "rootfs.img.sha256"), cancellationToken);
-        await CopyReleaseFileAsync(plan.Artifacts.VbmetaA.Path, Path.Combine(root, "vbmeta_a.img"), cancellationToken);
-        await CopyShaAsync(plan.Artifacts.VbmetaA.Path, Path.Combine(root, "vbmeta_a.img.sha256"), cancellationToken);
-        await CopyReleaseFileAsync(plan.Artifacts.VbmetaB.Path, Path.Combine(root, "vbmeta_b.img"), cancellationToken);
-        await CopyShaAsync(plan.Artifacts.VbmetaB.Path, Path.Combine(root, "vbmeta_b.img.sha256"), cancellationToken);
+        await CopyReleaseFileWithShaAsync(completeRoot, Path.Combine(root, "rootfs.img"), cancellationToken);
+        await CopyReleaseFileWithShaAsync(plan.Artifacts.VbmetaA.Path, Path.Combine(root, "vbmeta_a.img"), cancellationToken);
+        await CopyReleaseFileWithShaAsync(plan.Artifacts.VbmetaB.Path, Path.Combine(root, "vbmeta_b.img"), cancellationToken);
 
         var manifest = new JsonObject
         {
@@ -286,25 +283,19 @@ public sealed partial class ReleaseArtifactBuilder(
 
         var modulesPartitionBytes = plan.LogicalPartitions.Single(partition => partition.Name == "modules_a").SizeBytes;
         var completeModules = RequireCompleteLogicalPairArtifact(_imageWork, "modules", modulesPartitionBytes);
-        await CopyReleaseFileAsync(completeModules, Path.Combine(root, "modules.img"), cancellationToken);
-        await CopyShaAsync(completeModules, Path.Combine(root, "modules.img.sha256"), cancellationToken);
+        await CopyReleaseFileWithShaAsync(completeModules, Path.Combine(root, "modules.img"), cancellationToken);
         var firmwarePartitionBytes = plan.LogicalPartitions.Single(partition => partition.Name == "firmware_a").SizeBytes;
         var completeFirmware = RequireCompleteLogicalPairArtifact(_imageWork, "firmware", firmwarePartitionBytes);
-        await CopyReleaseFileAsync(completeFirmware, Path.Combine(root, "firmware.img"), cancellationToken);
-        await CopyShaAsync(completeFirmware, Path.Combine(root, "firmware.img.sha256"), cancellationToken);
+        await CopyReleaseFileWithShaAsync(completeFirmware, Path.Combine(root, "firmware.img"), cancellationToken);
         var recoveryPartitionBytes = plan.Partitions.Single(partition => partition.Name == "recovery_a").SizeBytes
             ?? throw new InvalidOperationException("recovery partition size is not fixed");
         var completeRecovery = RequireCompleteRecoveryPartitionArtifact(_imageWork, recoveryPartitionBytes);
-        await CopyReleaseFileAsync(completeRecovery, Path.Combine(root, "recovery.img"), cancellationToken);
-        await CopyShaAsync(completeRecovery, Path.Combine(root, "recovery.img.sha256"), cancellationToken);
-        await CopyReleaseFileAsync(plan.Artifacts.Boot.Path, Path.Combine(root, "boot.efi"), cancellationToken);
-        await CopyShaAsync(plan.Artifacts.Boot.Path, Path.Combine(root, "boot.efi.sha256"), cancellationToken);
+        await CopyReleaseFileWithShaAsync(completeRecovery, Path.Combine(root, "recovery.img"), cancellationToken);
+        await CopyReleaseFileWithShaAsync(plan.Artifacts.Boot.Path, Path.Combine(root, "boot.efi"), cancellationToken);
 
         var selectorName = Path.GetFileName(plan.Artifacts.Bootloader.Path);
-        await CopyReleaseFileAsync(plan.Artifacts.Bootloader.Path, Path.Combine(root, selectorName), cancellationToken);
-        await CopyShaAsync(plan.Artifacts.Bootloader.Path, Path.Combine(root, selectorName + ".sha256"), cancellationToken);
-        await CopyReleaseFileAsync(plan.Artifacts.Bootx64.Path, Path.Combine(root, "BOOTX64.EFI"), cancellationToken);
-        await CopyShaAsync(plan.Artifacts.Bootx64.Path, Path.Combine(root, "BOOTX64.EFI.sha256"), cancellationToken);
+        await CopyReleaseFileWithShaAsync(plan.Artifacts.Bootloader.Path, Path.Combine(root, selectorName), cancellationToken);
+        await CopyReleaseFileWithShaAsync(plan.Artifacts.Bootx64.Path, Path.Combine(root, "BOOTX64.EFI"), cancellationToken);
         var mokManager = Path.Combine(_imageWork, "mnt", "EFI", "BOOT", "mmx64.efi");
         if (plan.Security.SecureBoot)
         {
@@ -450,7 +441,7 @@ public sealed partial class ReleaseArtifactBuilder(
                 _releaseDirectory,
                 plan.Product.PackagePrefix + "-full-live-installer-" + channel + "-" + version + ".iso");
             File.Move(builtIso, finalIso, overwrite: true);
-            await WriteShaFileAsync(finalIso, finalIso + ".sha256", cancellationToken);
+            await WriteShaFileAsync(finalIso, finalIso + ".sha256", Path.GetFileName(finalIso), cancellationToken);
             return finalIso;
         }
         finally
@@ -1817,6 +1808,19 @@ public sealed partial class ReleaseArtifactBuilder(
         await FileWrites.CopyFileAsync(source, destination, cancellationToken: cancellationToken);
     }
 
+    internal static async Task CopyReleaseFileWithShaAsync(
+        string source,
+        string destination,
+        CancellationToken cancellationToken)
+    {
+        await CopyReleaseFileAsync(source, destination, cancellationToken);
+        await WriteShaFileAsync(
+            source,
+            destination + ".sha256",
+            Path.GetFileName(destination),
+            cancellationToken);
+    }
+
     internal static async Task CopyOptionalReleaseFileWithShaAsync(
         string source,
         string destination,
@@ -1826,15 +1830,24 @@ public sealed partial class ReleaseArtifactBuilder(
         if (File.Exists(source))
         {
             await FileWrites.CopyFileAsync(source, destination, cancellationToken: cancellationToken);
-            await WriteShaFileAsync(source, shaDestination, cancellationToken);
+            await WriteShaFileAsync(
+                source,
+                shaDestination,
+                Path.GetFileName(destination),
+                cancellationToken);
         }
     }
 
-    private static async Task CopyShaAsync(string source, string destination, CancellationToken cancellationToken)
-        => await WriteShaFileAsync(source, destination, cancellationToken);
-
-    private static async Task WriteShaFileAsync(string source, string destination, CancellationToken cancellationToken)
-        => await FileWrites.AtomicWriteTextAsync(destination, await Sha256HexAsync(source, cancellationToken) + "  " + Path.GetFileName(source) + "\n", 0644, cancellationToken);
+    private static async Task WriteShaFileAsync(
+        string source,
+        string destination,
+        string payloadFileName,
+        CancellationToken cancellationToken)
+        => await FileWrites.AtomicWriteTextAsync(
+            destination,
+            await Sha256HexAsync(source, cancellationToken) + "  " + payloadFileName + "\n",
+            0644,
+            cancellationToken);
 
     private static async Task<string> ReadDigestAsync(SystemImageArtifactPlan artifact, CancellationToken cancellationToken)
     {
