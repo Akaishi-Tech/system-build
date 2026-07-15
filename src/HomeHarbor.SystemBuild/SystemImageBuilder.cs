@@ -294,6 +294,11 @@ public sealed class SystemImageBuilder(
             RecoveryCmdline(),
             cancellationToken);
         InstallFile(recoveryBoot, Path.Combine(recoveryRootfs, "boot", "recovery_boot.efi"), 0644);
+        // The recovery partition boots the embedded UKI.  The package-provided
+        // kernel and initramfs are inputs to that UKI, not independent boot
+        // entries; retaining them duplicates roughly the entire boot payload
+        // inside every recovery slot.
+        RemoveBootKernelArtifacts(Path.Combine(recoveryRootfs, "boot"));
 
         var erofs = await ErofsImageTool.CreateAsync(
             plan.Security,

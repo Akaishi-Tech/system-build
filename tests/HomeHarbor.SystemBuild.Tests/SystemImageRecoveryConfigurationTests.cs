@@ -62,6 +62,30 @@ public sealed class SystemImageRecoveryConfigurationTests
         Assert.IsFalse(method.Contains("plan.Rootfs.MkinitcpioHooks", StringComparison.Ordinal));
     }
 
+    [TestMethod]
+    public void Recovery_Image_Keeps_Only_The_Embedded_Uki_Boot_Payload()
+    {
+        var source = File.ReadAllText(FindRepositoryFile(
+            "src",
+            "HomeHarbor.SystemBuild",
+            "SystemImageBuilder.cs"));
+        var install = source.IndexOf(
+            "InstallFile(recoveryBoot, Path.Combine(recoveryRootfs, \"boot\", \"recovery_boot.efi\"), 0644);",
+            StringComparison.Ordinal);
+        var remove = source.IndexOf(
+            "RemoveBootKernelArtifacts(Path.Combine(recoveryRootfs, \"boot\"));",
+            install,
+            StringComparison.Ordinal);
+        var erofs = source.IndexOf(
+            "var erofs = await ErofsImageTool.CreateAsync(",
+            install,
+            StringComparison.Ordinal);
+
+        Assert.IsGreaterThanOrEqualTo(0, install);
+        Assert.IsGreaterThan(install, remove);
+        Assert.IsGreaterThan(remove, erofs);
+    }
+
     private static string FindRepositoryFile(params string[] segments)
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
